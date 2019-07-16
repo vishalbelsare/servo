@@ -120,6 +120,7 @@ use net_traits::{
     Metadata, NetworkError, ReferrerPolicy, ResourceFetchTiming, ResourceThreads,
     ResourceTimingType,
 };
+use percent_encoding::percent_decode;
 use profile_traits::mem::{self as profile_mem, OpaqueSender, ReportsChan};
 use profile_traits::time::{self as profile_time, profile, ProfilerCategory};
 use script_layout_interface::message::{self, LayoutThreadInit, Msg, ReflowGoal};
@@ -155,7 +156,6 @@ use std::time::{Duration, SystemTime};
 use style::dom::OpaqueNode;
 use style::thread_state::{self, ThreadState};
 use time::{at_utc, get_time, precise_time_ns, Timespec};
-use url::percent_encoding::percent_decode;
 use url::Position;
 use webrender_api::{DocumentId, RenderApiSender};
 use webvr_traits::{WebVREvent, WebVRMsg};
