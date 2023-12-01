@@ -6,13 +6,14 @@
 
 //! A replacement for `Box<[T]>` that cbindgen can understand.
 
-use malloc_size_of::{MallocShallowSizeOf, MallocSizeOf, MallocSizeOfOps};
-use serde::de::{Deserialize, Deserializer};
-use serde::ser::{Serialize, Serializer};
 use std::marker::PhantomData;
 use std::ops::{Deref, DerefMut};
 use std::ptr::NonNull;
 use std::{fmt, iter, mem, slice};
+
+use malloc_size_of::{MallocShallowSizeOf, MallocSizeOf, MallocSizeOfOps};
+use serde::de::{Deserialize, Deserializer};
+use serde::ser::{Serialize, Serializer};
 use to_shmem::{self, SharedMemoryBuilder, ToShmem};
 
 /// A struct that basically replaces a `Box<[T]>`, but which cbindgen can
@@ -93,12 +94,6 @@ impl<T: Sized> OwnedSlice<T> {
         ret
     }
 
-    /// Iterate over all the elements in the slice taking ownership of them.
-    #[inline]
-    pub fn into_iter(self) -> impl Iterator<Item = T> + ExactSizeIterator {
-        self.into_vec().into_iter()
-    }
-
     /// Convert the regular slice into an owned slice.
     #[inline]
     pub fn from_slice(s: &[T]) -> Self
@@ -106,6 +101,16 @@ impl<T: Sized> OwnedSlice<T> {
         T: Clone,
     {
         Self::from(s.to_vec())
+    }
+}
+
+impl<T> IntoIterator for OwnedSlice<T> {
+    type Item = T;
+    type IntoIter = <Vec<T> as IntoIterator>::IntoIter;
+
+    #[inline]
+    fn into_iter(self) -> Self::IntoIter {
+        self.into_vec().into_iter()
     }
 }
 

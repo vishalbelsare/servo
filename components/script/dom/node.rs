@@ -4,6 +4,46 @@
 
 //! The core DOM types. Defines the basic DOM hierarchy as well as all the HTML elements.
 
+use std::borrow::Cow;
+use std::cell::{Cell, UnsafeCell};
+use std::default::Default;
+use std::ops::Range;
+use std::slice::from_ref;
+use std::sync::Arc as StdArc;
+use std::{cmp, iter, mem};
+
+use app_units::Au;
+use bitflags::bitflags;
+use devtools_traits::NodeInfo;
+use dom_struct::dom_struct;
+use euclid::default::{Rect, Size2D, Vector2D};
+use html5ever::{namespace_url, ns, Namespace, Prefix, QualName};
+use js::jsapi::JSObject;
+use js::rust::HandleObject;
+use libc::{self, c_void, uintptr_t};
+use malloc_size_of::{MallocSizeOf, MallocSizeOfOps};
+use msg::constellation_msg::{BrowsingContextId, PipelineId};
+use net_traits::image::base::{Image, ImageMetadata};
+use script_layout_interface::message::QueryMsg;
+use script_layout_interface::{
+    HTMLCanvasData, HTMLMediaData, LayoutElementType, LayoutNodeType, SVGSVGData,
+    StyleAndOpaqueLayoutData, TrustedNodeAddress,
+};
+use script_traits::{DocumentActivity, UntrustedNodeAddress};
+use selectors::matching::{
+    matches_selector_list, MatchingContext, MatchingMode, NeedsSelectorFlags,
+};
+use selectors::parser::SelectorList;
+use servo_arc::Arc;
+use servo_url::ServoUrl;
+use smallvec::SmallVec;
+use style::context::QuirksMode;
+use style::dom::OpaqueNode;
+use style::properties::ComputedValues;
+use style::selector_parser::{SelectorImpl, SelectorParser};
+use style::stylesheets::Stylesheet;
+use uuid::Uuid;
+
 use crate::document_loader::DocumentLoader;
 use crate::dom::attr::Attr;
 use crate::dom::bindings::cell::{DomRefCell, Ref, RefMut};
@@ -17,16 +57,17 @@ use crate::dom::bindings::codegen::Bindings::NodeBinding::{
 };
 use crate::dom::bindings::codegen::Bindings::NodeListBinding::NodeListMethods;
 use crate::dom::bindings::codegen::Bindings::ProcessingInstructionBinding::ProcessingInstructionMethods;
-use crate::dom::bindings::codegen::Bindings::ShadowRootBinding::ShadowRootBinding::ShadowRootMethods;
+use crate::dom::bindings::codegen::Bindings::ShadowRootBinding::ShadowRoot_Binding::ShadowRootMethods;
 use crate::dom::bindings::codegen::Bindings::WindowBinding::WindowMethods;
 use crate::dom::bindings::codegen::InheritTypes::DocumentFragmentTypeId;
 use crate::dom::bindings::codegen::UnionTypes::NodeOrString;
 use crate::dom::bindings::conversions::{self, DerivedFrom};
 use crate::dom::bindings::error::{Error, ErrorResult, Fallible};
-use crate::dom::bindings::inheritance::{Castable, CharacterDataTypeId, ElementTypeId};
-use crate::dom::bindings::inheritance::{EventTargetTypeId, HTMLElementTypeId, NodeTypeId};
-use crate::dom::bindings::inheritance::{SVGElementTypeId, SVGGraphicsElementTypeId, TextTypeId};
-use crate::dom::bindings::reflector::{reflect_dom_object, DomObject, DomObjectWrap};
+use crate::dom::bindings::inheritance::{
+    Castable, CharacterDataTypeId, ElementTypeId, EventTargetTypeId, HTMLElementTypeId, NodeTypeId,
+    SVGElementTypeId, SVGGraphicsElementTypeId, TextTypeId,
+};
+use crate::dom::bindings::reflector::{reflect_dom_object_with_proto, DomObject, DomObjectWrap};
 use crate::dom::bindings::root::{Dom, DomRoot, DomSlice, LayoutDom, MutNullableDom};
 use crate::dom::bindings::str::{DOMString, USVString};
 use crate::dom::bindings::xmlname::namespace_from_domstring;
@@ -48,7 +89,6 @@ use crate::dom::htmlimageelement::{HTMLImageElement, LayoutHTMLImageElementHelpe
 use crate::dom::htmlinputelement::{HTMLInputElement, LayoutHTMLInputElementHelpers};
 use crate::dom::htmllinkelement::HTMLLinkElement;
 use crate::dom::htmlmediaelement::{HTMLMediaElement, LayoutHTMLMediaElementHelpers};
-use crate::dom::htmlmetaelement::HTMLMetaElement;
 use crate::dom::htmlstyleelement::HTMLStyleElement;
 use crate::dom::htmltextareaelement::{HTMLTextAreaElement, LayoutHTMLTextAreaElementHelpers};
 use crate::dom::mouseevent::MouseEvent;
@@ -64,42 +104,6 @@ use crate::dom::text::Text;
 use crate::dom::virtualmethods::{vtable_for, VirtualMethods};
 use crate::dom::window::Window;
 use crate::script_thread::ScriptThread;
-use app_units::Au;
-use devtools_traits::NodeInfo;
-use dom_struct::dom_struct;
-use euclid::default::{Point2D, Rect, Size2D, Vector2D};
-use html5ever::{Namespace, Prefix, QualName};
-use js::jsapi::JSObject;
-use libc::{self, c_void, uintptr_t};
-use malloc_size_of::{MallocSizeOf, MallocSizeOfOps};
-use msg::constellation_msg::{BrowsingContextId, PipelineId};
-use net_traits::image::base::{Image, ImageMetadata};
-use script_layout_interface::message::QueryMsg;
-use script_layout_interface::{HTMLCanvasData, HTMLMediaData, LayoutElementType, LayoutNodeType};
-use script_layout_interface::{SVGSVGData, StyleAndOpaqueLayoutData, TrustedNodeAddress};
-use script_traits::DocumentActivity;
-use script_traits::UntrustedNodeAddress;
-use selectors::matching::{matches_selector_list, MatchingContext, MatchingMode};
-use selectors::parser::SelectorList;
-use servo_arc::Arc;
-use servo_atoms::Atom;
-use servo_url::ServoUrl;
-use smallvec::SmallVec;
-use std::borrow::Cow;
-use std::cell::{Cell, UnsafeCell};
-use std::cmp;
-use std::default::Default;
-use std::iter;
-use std::mem;
-use std::ops::Range;
-use std::slice::from_ref;
-use std::sync::Arc as StdArc;
-use style::context::QuirksMode;
-use style::dom::OpaqueNode;
-use style::properties::ComputedValues;
-use style::selector_parser::{SelectorImpl, SelectorParser};
-use style::stylesheets::Stylesheet;
-use uuid::Uuid;
 
 //
 // The basic Node structure
@@ -152,31 +156,34 @@ pub struct Node {
 
     /// Style+Layout information.
     #[ignore_malloc_size_of = "trait object"]
+    #[no_trace]
     style_and_layout_data: DomRefCell<Option<Box<StyleAndOpaqueLayoutData>>>,
 }
 
+/// Flags for node items
+#[derive(Clone, Copy, JSTraceable, MallocSizeOf)]
+pub struct NodeFlags(u16);
+
 bitflags! {
-    #[doc = "Flags for node items."]
-    #[derive(JSTraceable, MallocSizeOf)]
-    pub struct NodeFlags: u16 {
-        #[doc = "Specifies whether this node is in a document."]
+    impl NodeFlags: u16 {
+        /// Specifies whether this node is in a document.
         const IS_IN_DOC = 1 << 0;
 
-        #[doc = "Specifies whether this node needs style recalc on next reflow."]
+        /// Specifies whether this node needs style recalc on next reflow.
         const HAS_DIRTY_DESCENDANTS = 1 << 1;
 
-        #[doc = "Specifies whether or not there is an authentic click in progress on \
-                 this element."]
+        /// Specifies whether or not there is an authentic click in progress on
+        /// this element.
         const CLICK_IN_PROGRESS = 1 << 2;
 
-        #[doc = "Specifies whether this node is focusable and whether it is supposed \
-                 to be reachable with using sequential focus navigation."]
+        /// Specifies whether this node is focusable and whether it is supposed
+        /// to be reachable with using sequential focus navigation."]
         const SEQUENTIALLY_FOCUSABLE = 1 << 3;
 
         // There are two free bits here.
 
-        #[doc = "Specifies whether the parser has set an associated form owner for \
-                 this element. Only applicable for form-associatable elements."]
+        /// Specifies whether the parser has set an associated form owner for
+        /// this element. Only applicable for form-associatable elements.
         const PARSER_ASSOCIATED_FORM_OWNER = 1 << 6;
 
         /// Whether this element has a snapshot stored due to a style or
@@ -466,13 +473,13 @@ impl<'a> Iterator for QuerySelectorIterator {
             .filter_map(|node| {
                 // TODO(cgaebel): Is it worth it to build a bloom filter here
                 // (instead of passing `None`)? Probably.
-                //
-                // FIXME(bholley): Consider an nth-index cache here.
+                let mut nth_index_cache = Default::default();
                 let mut ctx = MatchingContext::new(
                     MatchingMode::Normal,
                     None,
-                    None,
+                    &mut nth_index_cache,
                     node.owner_doc().quirks_mode(),
+                    NeedsSelectorFlags::No,
                 );
                 if let Some(element) = DomRoot::downcast(node) {
                     if matches_selector_list(selectors, &element, &mut ctx) {
@@ -800,38 +807,42 @@ impl Node {
     // https://drafts.csswg.org/cssom-view/#dom-element-scrollwidth
     // https://drafts.csswg.org/cssom-view/#dom-element-scrollheight
     pub fn scroll_area(&self) -> Rect<i32> {
-        // Step 1
+        // "1. Let document be the element’s node document.""
         let document = self.owner_doc();
-        // Step 3
+
+        // "2. If document is not the active document, return zero and terminate these steps.""
+        if !document.is_active() {
+            return Rect::zero();
+        }
+
+        // "3. Let viewport width/height be the width of the viewport excluding the width/height of the
+        // scroll bar, if any, or zero if there is no viewport."
         let window = document.window();
+        let viewport = Size2D::new(window.InnerWidth(), window.InnerHeight());
 
-        let html_element = document.GetDocumentElement();
-
+        let in_quirks_mode = document.quirks_mode() == QuirksMode::Quirks;
+        let is_root = self.downcast::<Element>().map_or(false, |e| e.is_root());
         let is_body_element = self
             .downcast::<HTMLBodyElement>()
             .map_or(false, |e| e.is_the_html_body_element());
 
-        let scroll_area = window.scroll_area_query(self);
-
-        match (
-            document != window.Document(),
-            is_body_element,
-            document.quirks_mode(),
-            html_element.as_deref() == self.downcast::<Element>(),
-        ) {
-            // Step 2 && Step 5
-            (true, _, _, _) | (_, false, QuirksMode::Quirks, true) => Rect::zero(),
-            // Step 6 && Step 7
-            (false, false, _, true) | (false, true, QuirksMode::Quirks, _) => Rect::new(
-                Point2D::new(window.ScrollX(), window.ScrollY()),
-                Size2D::new(
-                    cmp::max(window.InnerWidth(), scroll_area.size.width),
-                    cmp::max(window.InnerHeight(), scroll_area.size.height),
-                ),
-            ),
-            // Step 9
-            _ => scroll_area,
+        // "4. If the element is the root element and document is not in quirks mode
+        // return max(viewport scrolling area width/height, viewport width/height)."
+        // "5. If the element is the body element, document is in quirks mode and the
+        // element is not potentially scrollable, return max(viewport scrolling area
+        // width, viewport width)."
+        if (is_root && !in_quirks_mode) || (is_body_element && in_quirks_mode) {
+            let viewport_scrolling_area = window.scrolling_area_query(None);
+            return Rect::new(
+                viewport_scrolling_area.origin,
+                viewport_scrolling_area.size.max(viewport),
+            );
         }
+
+        // "6. If the element does not have any associated box return zero and terminate
+        // these steps."
+        // "7. Return the width of the element’s scrolling area."
+        window.scrolling_area_query(Some(self))
     }
 
     pub fn scroll_offset(&self) -> Vector2D<f32> {
@@ -949,17 +960,19 @@ impl Node {
     // https://dom.spec.whatwg.org/#dom-parentnode-queryselector
     pub fn query_selector(&self, selectors: DOMString) -> Fallible<Option<DomRoot<Element>>> {
         // Step 1.
-        match SelectorParser::parse_author_origin_no_namespace(&selectors) {
+        let doc = self.owner_doc();
+        match SelectorParser::parse_author_origin_no_namespace(&selectors, &doc.url()) {
             // Step 2.
             Err(_) => Err(Error::Syntax),
             // Step 3.
             Ok(selectors) => {
-                // FIXME(bholley): Consider an nth-index cache here.
+                let mut nth_index_cache = Default::default();
                 let mut ctx = MatchingContext::new(
                     MatchingMode::Normal,
                     None,
-                    None,
-                    self.owner_doc().quirks_mode(),
+                    &mut nth_index_cache,
+                    doc.quirks_mode(),
+                    NeedsSelectorFlags::No,
                 );
                 Ok(self
                     .traverse_preorder(ShadowIncluding::No)
@@ -975,7 +988,8 @@ impl Node {
     /// whilst iterating, otherwise the iterator may be invalidated.
     pub fn query_selector_iter(&self, selectors: DOMString) -> Fallible<QuerySelectorIterator> {
         // Step 1.
-        match SelectorParser::parse_author_origin_no_namespace(&selectors) {
+        let url = self.owner_doc().url();
+        match SelectorParser::parse_author_origin_no_namespace(&selectors, &url) {
             // Step 2.
             Err(_) => Err(Error::Syntax),
             // Step 3.
@@ -1080,7 +1094,7 @@ impl Node {
 
         if rare_data.unique_id.is_none() {
             let id = UniqueId::new();
-            ScriptThread::save_node_id(id.borrow().to_simple().to_string());
+            ScriptThread::save_node_id(id.borrow().simple().to_string());
             rare_data.unique_id = Some(id);
         }
         rare_data
@@ -1088,7 +1102,7 @@ impl Node {
             .as_ref()
             .unwrap()
             .borrow()
-            .to_simple()
+            .simple()
             .to_string()
     }
 
@@ -1202,8 +1216,6 @@ impl Node {
             node.get_stylesheet()
         } else if let Some(node) = self.downcast::<HTMLLinkElement>() {
             node.get_stylesheet()
-        } else if let Some(node) = self.downcast::<HTMLMetaElement>() {
-            node.get_stylesheet()
         } else {
             None
         }
@@ -1213,8 +1225,6 @@ impl Node {
         if let Some(node) = self.downcast::<HTMLStyleElement>() {
             node.get_cssom_stylesheet()
         } else if let Some(node) = self.downcast::<HTMLLinkElement>() {
-            node.get_cssom_stylesheet()
-        } else if let Some(node) = self.downcast::<HTMLMetaElement>() {
             node.get_cssom_stylesheet()
         } else {
             None
@@ -1239,34 +1249,6 @@ impl Node {
                     .Host()
                     .upcast::<Node>(),
             );
-        }
-    }
-
-    // https://html.spec.whatwg.org/multipage/#dom-document-nameditem-filter
-    pub fn is_document_named_item(&self, name: &Atom) -> bool {
-        let html_elem_type = match self.type_id() {
-            NodeTypeId::Element(ElementTypeId::HTMLElement(type_)) => type_,
-            _ => return false,
-        };
-        let elem = self
-            .downcast::<Element>()
-            .expect("Node with an Element::HTMLElement NodeTypeID must be an Element");
-        match html_elem_type {
-            HTMLElementTypeId::HTMLFormElement | HTMLElementTypeId::HTMLIFrameElement => {
-                elem.get_name().map_or(false, |n| n == *name)
-            },
-            HTMLElementTypeId::HTMLImageElement =>
-            // Images can match by id, but only when their name is non-empty.
-            {
-                elem.get_name().map_or(false, |n| {
-                    n == *name || elem.get_id().map_or(false, |i| i == *name)
-                })
-            },
-            // TODO: Handle <embed> and <object>; these depend on
-            // whether the element is "exposed", a concept which
-            // doesn't fully make sense until embed/object behaviors
-            // are actually implemented.
-            _ => false,
         }
     }
 
@@ -1570,17 +1552,13 @@ impl<'dom> LayoutNodeHelpers<'dom> for LayoutDom<'dom, Node> {
     }
 
     fn iframe_browsing_context_id(self) -> Option<BrowsingContextId> {
-        let iframe_element = self
-            .downcast::<HTMLIFrameElement>()
-            .expect("not an iframe element!");
-        iframe_element.browsing_context_id()
+        self.downcast::<HTMLIFrameElement>()
+            .map_or(None, |iframe_element| iframe_element.browsing_context_id())
     }
 
     fn iframe_pipeline_id(self) -> Option<PipelineId> {
-        let iframe_element = self
-            .downcast::<HTMLIFrameElement>()
-            .expect("not an iframe element!");
-        iframe_element.pipeline_id()
+        self.downcast::<HTMLIFrameElement>()
+            .map_or(None, |iframe_element| iframe_element.pipeline_id())
     }
 
     #[allow(unsafe_code)]
@@ -1789,15 +1767,26 @@ impl Node {
     where
         N: DerivedFrom<Node> + DomObject + DomObjectWrap,
     {
+        Self::reflect_node_with_proto(node, document, None)
+    }
+
+    pub fn reflect_node_with_proto<N>(
+        node: Box<N>,
+        document: &Document,
+        proto: Option<HandleObject>,
+    ) -> DomRoot<N>
+    where
+        N: DerivedFrom<Node> + DomObject + DomObjectWrap,
+    {
         let window = document.window();
-        reflect_dom_object(node, window)
+        reflect_dom_object_with_proto(node, window, proto)
     }
 
     pub fn new_inherited(doc: &Document) -> Node {
         Node::new_(NodeFlags::new(), Some(doc))
     }
 
-    #[allow(unrooted_must_root)]
+    #[allow(crown::unrooted_must_root)]
     pub fn new_document_node() -> Node {
         Node::new_(
             NodeFlags::new() | NodeFlags::IS_IN_DOC | NodeFlags::IS_CONNECTED,
@@ -1805,7 +1794,7 @@ impl Node {
         )
     }
 
-    #[allow(unrooted_must_root)]
+    #[allow(crown::unrooted_must_root)]
     fn new_(flags: NodeFlags, doc: Option<&Document>) -> Node {
         Node {
             eventtarget: EventTarget::new_inherited(),
@@ -1905,8 +1894,7 @@ impl Node {
             NodeTypeId::Element(_) |
             NodeTypeId::CharacterData(CharacterDataTypeId::ProcessingInstruction) |
             NodeTypeId::CharacterData(CharacterDataTypeId::Comment) => (),
-            NodeTypeId::Document(_) => return Err(Error::HierarchyRequest),
-            NodeTypeId::Attr => unreachable!(),
+            NodeTypeId::Document(_) | NodeTypeId::Attr => return Err(Error::HierarchyRequest),
         }
 
         // Step 6.
@@ -1975,8 +1963,9 @@ impl Node {
                     }
                 },
                 NodeTypeId::CharacterData(_) => (),
-                NodeTypeId::Document(_) => unreachable!(),
-                NodeTypeId::Attr => unreachable!(),
+                // Because Document and Attr should already throw `HierarchyRequest`
+                // error, both of them are unreachable here.
+                NodeTypeId::Document(_) | NodeTypeId::Attr => unreachable!(),
             }
         }
         Ok(())
@@ -2323,6 +2312,7 @@ impl Node {
                     &document,
                     ElementCreator::ScriptCreated,
                     CustomElementCreationMode::Asynchronous,
+                    None,
                 );
                 DomRoot::upcast::<Node>(element)
             },
@@ -2661,7 +2651,7 @@ impl NodeMethods for Node {
             NodeTypeId::DocumentType if !self.is::<Document>() => {
                 return Err(Error::HierarchyRequest);
             },
-            NodeTypeId::Document(_) => return Err(Error::HierarchyRequest),
+            NodeTypeId::Document(_) | NodeTypeId::Attr => return Err(Error::HierarchyRequest),
             _ => (),
         }
 
@@ -2712,6 +2702,8 @@ impl NodeMethods for Node {
                     }
                 },
                 NodeTypeId::CharacterData(..) => (),
+                // Because Document and Attr should already throw `HierarchyRequest`
+                // error, both of them are unreachable here.
                 NodeTypeId::Document(_) => unreachable!(),
                 NodeTypeId::Attr => unreachable!(),
             }
@@ -3158,7 +3150,7 @@ pub fn containing_shadow_root<T: DerivedFrom<Node> + DomObject>(
     derived.upcast().containing_shadow_root()
 }
 
-#[allow(unrooted_must_root)]
+#[allow(crown::unrooted_must_root)]
 pub fn stylesheets_owner_from_node<T: DerivedFrom<Node> + DomObject>(
     derived: &T,
 ) -> StyleSheetListOwner {

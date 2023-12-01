@@ -5,9 +5,8 @@
 <%namespace name="helpers" file="/helpers.mako.rs" />
 
 <%helpers:shorthand name="outline"
-                    engines="gecko servo-2013"
+                    engines="gecko servo"
                     sub_properties="outline-color outline-style outline-width"
-                    derive_serialize="True"
                     spec="https://drafts.csswg.org/css-ui/#propdef-outline">
     use crate::properties::longhands::{outline_color, outline_width, outline_style};
     use crate::values::specified;
@@ -56,50 +55,26 @@
             Err(input.new_custom_error(StyleParseErrorKind::UnspecifiedError))
         }
     }
-</%helpers:shorthand>
-
-// The -moz-outline-radius shorthand is non-standard and not on a standards track.
-<%helpers:shorthand
-    name="-moz-outline-radius"
-    engines="gecko"
-    sub_properties="${' '.join(
-        '-moz-outline-radius-%s' % corner
-        for corner in ['topleft', 'topright', 'bottomright', 'bottomleft']
-    )}"
-    spec="Nonstandard (https://developer.mozilla.org/en-US/docs/Web/CSS/-moz-outline-radius)"
->
-    use crate::values::generics::rect::Rect;
-    use crate::values::specified::border::BorderRadius;
-    use crate::parser::Parse;
-
-    pub fn parse_value<'i, 't>(
-        context: &ParserContext,
-        input: &mut Parser<'i, 't>,
-    ) -> Result<Longhands, ParseError<'i>> {
-        let radii = BorderRadius::parse(context, input)?;
-        Ok(expanded! {
-            _moz_outline_radius_topleft: radii.top_left,
-            _moz_outline_radius_topright: radii.top_right,
-            _moz_outline_radius_bottomright: radii.bottom_right,
-            _moz_outline_radius_bottomleft: radii.bottom_left,
-        })
-    }
 
     impl<'a> ToCss for LonghandsToSerialize<'a>  {
         fn to_css<W>(&self, dest: &mut CssWriter<W>) -> fmt::Result where W: fmt::Write {
-            use crate::values::generics::border::BorderCornerRadius;
+            let mut wrote_value = false;
 
-            let LonghandsToSerialize {
-                _moz_outline_radius_topleft: &BorderCornerRadius(ref tl),
-                _moz_outline_radius_topright: &BorderCornerRadius(ref tr),
-                _moz_outline_radius_bottomright: &BorderCornerRadius(ref br),
-                _moz_outline_radius_bottomleft: &BorderCornerRadius(ref bl),
-            } = *self;
+            % for name in "color style width".split():
+                if *self.outline_${name} != outline_${name}::get_initial_specified_value() {
+                    if wrote_value {
+                        dest.write_char(' ')?;
+                    }
+                    self.outline_${name}.to_css(dest)?;
+                    wrote_value = true;
+                }
+            % endfor
 
-            let widths = Rect::new(tl.width(), tr.width(), br.width(), bl.width());
-            let heights = Rect::new(tl.height(), tr.height(), br.height(), bl.height());
+            if !wrote_value {
+                self.outline_style.to_css(dest)?;
+            }
 
-            BorderRadius::serialize_rects(widths, heights, dest)
+            Ok(())
         }
     }
 </%helpers:shorthand>

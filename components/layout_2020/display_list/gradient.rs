@@ -66,7 +66,7 @@ pub(super) fn build_linear(
 ) {
     use style::values::specified::position::HorizontalPositionKeyword::*;
     use style::values::specified::position::VerticalPositionKeyword::*;
-    use webrender_api::units::LayoutVector2D as Vec2;
+    use units::LayoutVector2D as Vec2;
     let gradient_box = layer.tile_size;
 
     // A vector of length 1.0 in the direction of the gradient line
@@ -144,9 +144,9 @@ pub(super) fn build_linear(
 
     let stops = fixup_stops(style, items, Length::new(gradient_line_length));
     let linear_gradient = builder
-        .wr
+        .wr()
         .create_gradient(start_point, end_point, stops, extend_mode);
-    builder.wr.push_gradient(
+    builder.wr().push_gradient(
         &layer.common,
         layer.bounds,
         linear_gradient,
@@ -244,9 +244,9 @@ pub(super) fn build_radial(
 
     let stops = fixup_stops(style, items, Length::new(gradient_line_length));
     let radial_gradient = builder
-        .wr
+        .wr()
         .create_radial_gradient(center, radii, stops, extend_mode);
-    builder.wr.push_radial_gradient(
+    builder.wr().push_radial_gradient(
         &layer.common,
         layer.bounds,
         radial_gradient,
@@ -275,11 +275,11 @@ fn fixup_stops(
     for item in items {
         match item {
             GradientItem::SimpleColorStop(color) => stops.push(ColorStop {
-                color: super::rgba(style.resolve_color(*color)),
+                color: super::rgba(style.resolve_color(color.clone())),
                 position: None,
             }),
             GradientItem::ComplexColorStop { color, position } => stops.push(ColorStop {
-                color: super::rgba(style.resolve_color(*color)),
+                color: super::rgba(style.resolve_color(color.clone())),
                 position: Some(if gradient_line_length.px() == 0. {
                     0.
                 } else {

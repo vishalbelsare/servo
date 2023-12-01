@@ -2,10 +2,24 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+use std::cell::Cell;
+use std::ptr;
+
+use dom_struct::dom_struct;
+use js::conversions::ToJSValConvertible;
+use js::jsapi::{JSAutoRealm, JSObject};
+use js::jsval::UndefinedValue;
+use js::rust::CustomAutoRooterGuard;
+use js::typedarray::{ArrayBuffer, ArrayBufferView, CreateWith};
+use script_traits::serializable::BlobImpl;
+use servo_media::webrtc::{
+    DataChannelId, DataChannelInit, DataChannelMessage, DataChannelState, WebRtcError,
+};
+
 use crate::dom::bindings::cell::DomRefCell;
-use crate::dom::bindings::codegen::Bindings::RTCDataChannelBinding::RTCDataChannelInit;
-use crate::dom::bindings::codegen::Bindings::RTCDataChannelBinding::RTCDataChannelMethods;
-use crate::dom::bindings::codegen::Bindings::RTCDataChannelBinding::RTCDataChannelState;
+use crate::dom::bindings::codegen::Bindings::RTCDataChannelBinding::{
+    RTCDataChannelInit, RTCDataChannelMethods, RTCDataChannelState,
+};
 use crate::dom::bindings::codegen::Bindings::RTCErrorBinding::{RTCErrorDetailType, RTCErrorInit};
 use crate::dom::bindings::error::{Error, Fallible};
 use crate::dom::bindings::inheritance::Castable;
@@ -20,18 +34,6 @@ use crate::dom::messageevent::MessageEvent;
 use crate::dom::rtcerror::RTCError;
 use crate::dom::rtcerrorevent::RTCErrorEvent;
 use crate::dom::rtcpeerconnection::RTCPeerConnection;
-use dom_struct::dom_struct;
-use js::conversions::ToJSValConvertible;
-use js::jsapi::{JSAutoRealm, JSObject};
-use js::jsval::UndefinedValue;
-use js::rust::CustomAutoRooterGuard;
-use js::typedarray::{ArrayBuffer, ArrayBufferView, CreateWith};
-use script_traits::serializable::BlobImpl;
-use servo_media::webrtc::{
-    DataChannelId, DataChannelInit, DataChannelMessage, DataChannelState, WebRtcError,
-};
-use std::cell::Cell;
-use std::ptr;
 
 #[dom_struct]
 pub struct RTCDataChannel {
@@ -51,7 +53,7 @@ pub struct RTCDataChannel {
 }
 
 impl RTCDataChannel {
-    #[allow(unrooted_must_root)]
+    #[allow(crown::unrooted_must_root)]
     pub fn new_inherited(
         peer_connection: &RTCPeerConnection,
         label: USVString,
@@ -135,7 +137,7 @@ impl RTCDataChannel {
 
     pub fn on_error(&self, error: WebRtcError) {
         let global = self.global();
-        let cx = global.get_cx();
+        let cx = GlobalScope::get_cx();
         let _ac = JSAutoRealm::new(*cx, self.reflector().get_jsobject().get());
         let init = RTCErrorInit {
             errorDetail: RTCErrorDetailType::Data_channel_failure,
@@ -157,7 +159,7 @@ impl RTCDataChannel {
     pub fn on_message(&self, channel_message: DataChannelMessage) {
         unsafe {
             let global = self.global();
-            let cx = global.get_cx();
+            let cx = GlobalScope::get_cx();
             let _ac = JSAutoRealm::new(*cx, self.reflector().get_jsobject().get());
             rooted!(in(*cx) let mut message = UndefinedValue());
 

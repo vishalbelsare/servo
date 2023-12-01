@@ -4,69 +4,216 @@
 
 //! Computed values for font properties
 
-#[cfg(feature = "gecko")]
-use crate::gecko_bindings::sugar::refptr::RefPtr;
-#[cfg(feature = "gecko")]
-use crate::gecko_bindings::{bindings, structs};
-use crate::values::animated::{ToAnimatedValue, ToAnimatedZero};
+use crate::parser::{Parse, ParserContext};
+use crate::values::animated::ToAnimatedValue;
 use crate::values::computed::{
-    Angle, Context, Integer, Length, NonNegativeLength, NonNegativePercentage,
+    Angle, Context, Integer, Length, NonNegativeLength, NonNegativeNumber, Number, Percentage,
+    ToComputedValue,
 };
-use crate::values::computed::{Number, Percentage, ToComputedValue};
-use crate::values::generics::font::{FeatureTagValue, FontSettings, VariationValue};
+use crate::values::generics::font::{
+    FeatureTagValue, FontSettings, TaggedFontValue, VariationValue,
+};
 use crate::values::generics::{font as generics, NonNegative};
 use crate::values::specified::font::{
     self as specified, KeywordInfo, MAX_FONT_WEIGHT, MIN_FONT_WEIGHT,
 };
 use crate::values::specified::length::{FontBaseSize, NoCalcLength};
-use crate::values::CSSFloat;
 use crate::Atom;
 use cssparser::{serialize_identifier, CssStringWriter, Parser};
 #[cfg(feature = "gecko")]
 use malloc_size_of::{MallocSizeOf, MallocSizeOfOps};
 use std::fmt::{self, Write};
-use std::hash::{Hash, Hasher};
-#[cfg(feature = "gecko")]
-use std::mem::{self, ManuallyDrop};
-#[cfg(feature = "servo")]
-use std::slice;
 use style_traits::{CssWriter, ParseError, ToCss};
-#[cfg(feature = "gecko")]
-use to_shmem::{self, SharedMemoryBuilder, ToShmem};
 
 pub use crate::values::computed::Length as MozScriptMinSize;
-pub use crate::values::specified::font::{FontSynthesis, MozScriptSizeMultiplier};
-pub use crate::values::specified::font::{XLang, XTextZoom};
+pub use crate::values::specified::font::MozScriptSizeMultiplier;
+pub use crate::values::specified::font::{FontPalette, FontSynthesis};
+pub use crate::values::specified::font::{
+    FontVariantAlternates, FontVariantEastAsian, FontVariantLigatures, FontVariantNumeric, XLang,
+    XTextScale,
+};
 pub use crate::values::specified::Integer as SpecifiedInteger;
+pub use crate::values::specified::Number as SpecifiedNumber;
+
+/// Generic template for font property type classes that use a fixed-point
+/// internal representation with `FRACTION_BITS` for the fractional part.
+///
+/// Values are constructed from and exposed as floating-point, but stored
+/// internally as fixed point, so there will be a quantization effect on
+/// fractional values, depending on the number of fractional bits used.
+///
+/// Using (16-bit) fixed-point types rather than floats for these style
+/// attributes reduces the memory footprint of gfxFontEntry and gfxFontStyle; it
+/// will also tend to reduce the number of distinct font instances that get
+/// created, particularly when styles are animated or set to arbitrary values
+/// (e.g. by sliders in the UI), which should reduce pressure on graphics
+/// resources and improve cache hit rates.
+///
+/// cbindgen:derive-lt
+/// cbindgen:derive-lte
+/// cbindgen:derive-gt
+/// cbindgen:derive-gte
+#[repr(C)]
+#[derive(
+    Clone,
+    ComputeSquaredDistance,
+    Copy,
+    Debug,
+    Eq,
+    Hash,
+    MallocSizeOf,
+    PartialEq,
+    PartialOrd,
+    ToResolvedValue,
+)]
+#[cfg_attr(feature = "servo", derive(Deserialize, Serialize))]
+pub struct FixedPoint<T, const FRACTION_BITS: u16> {
+    value: T,
+}
+
+impl<T, const FRACTION_BITS: u16> FixedPoint<T, FRACTION_BITS>
+where
+    T: num_traits::cast::AsPrimitive<f32>,
+    f32: num_traits::cast::AsPrimitive<T>,
+{
+    const SCALE: u16 = 1 << FRACTION_BITS;
+    const INVERSE_SCALE: f32 = 1.0 / Self::SCALE as f32;
+
+    /// Returns a fixed-point bit from a floating-point context.
+    fn from_float(v: f32) -> Self {
+        use num_traits::cast::AsPrimitive;
+        Self {
+            value: (v * Self::SCALE as f32).round().as_(),
+        }
+    }
+
+    /// Returns the floating-point representation.
+    fn to_float(&self) -> f32 {
+        self.value.as_() * Self::INVERSE_SCALE
+    }
+}
+
+/// font-weight: range 1..1000, fractional values permitted; keywords
+/// 'normal', 'bold' aliased to 400, 700 respectively.
+///
+/// We use an unsigned 10.6 fixed-point value (range 0.0 - 1023.984375)
+pub const FONT_WEIGHT_FRACTION_BITS: u16 = 6;
+
+/// This is an alias which is useful mostly as a cbindgen / C++ inference
+/// workaround.
+pub type FontWeightFixedPoint = FixedPoint<u16, FONT_WEIGHT_FRACTION_BITS>;
 
 /// A value for the font-weight property per:
 ///
 /// https://drafts.csswg.org/css-fonts-4/#propdef-font-weight
 ///
-/// This is effectively just a `Number`.
+/// cbindgen:derive-lt
+/// cbindgen:derive-lte
+/// cbindgen:derive-gt
+/// cbindgen:derive-gte
 #[derive(
-    Clone, ComputeSquaredDistance, Copy, Debug, MallocSizeOf, PartialEq, ToCss, ToResolvedValue,
+    Clone,
+    ComputeSquaredDistance,
+    Copy,
+    Debug,
+    Hash,
+    MallocSizeOf,
+    PartialEq,
+    PartialOrd,
+    ToResolvedValue,
 )]
 #[cfg_attr(feature = "servo", derive(Deserialize, Serialize))]
-pub struct FontWeight(pub Number);
-
-impl Hash for FontWeight {
-    fn hash<H: Hasher>(&self, hasher: &mut H) {
-        hasher.write_u64((self.0 * 10000.).trunc() as u64);
-    }
-}
-
+#[repr(C)]
+pub struct FontWeight(FontWeightFixedPoint);
 impl ToAnimatedValue for FontWeight {
     type AnimatedValue = Number;
 
     #[inline]
     fn to_animated_value(self) -> Self::AnimatedValue {
-        self.0
+        self.value()
     }
 
     #[inline]
     fn from_animated_value(animated: Self::AnimatedValue) -> Self {
-        FontWeight(animated.max(MIN_FONT_WEIGHT).min(MAX_FONT_WEIGHT))
+        FontWeight::from_float(animated)
+    }
+}
+
+impl ToCss for FontWeight {
+    fn to_css<W>(&self, dest: &mut CssWriter<W>) -> fmt::Result
+    where
+        W: fmt::Write,
+    {
+        self.value().to_css(dest)
+    }
+}
+
+impl FontWeight {
+    /// The `normal` keyword.
+    pub const NORMAL: FontWeight = FontWeight(FontWeightFixedPoint {
+        value: 400 << FONT_WEIGHT_FRACTION_BITS,
+    });
+
+    /// The `bold` value.
+    pub const BOLD: FontWeight = FontWeight(FontWeightFixedPoint {
+        value: 700 << FONT_WEIGHT_FRACTION_BITS,
+    });
+
+    /// The threshold from which we consider a font bold.
+    pub const BOLD_THRESHOLD: FontWeight = FontWeight(FontWeightFixedPoint {
+        value: 600 << FONT_WEIGHT_FRACTION_BITS,
+    });
+
+    /// Returns the `normal` keyword value.
+    pub fn normal() -> Self {
+        Self::NORMAL
+    }
+
+    /// Weither this weight is bold
+    pub fn is_bold(&self) -> bool {
+        *self >= Self::BOLD_THRESHOLD
+    }
+
+    /// Returns the value as a float.
+    pub fn value(&self) -> f32 {
+        self.0.to_float()
+    }
+
+    /// Construct a valid weight from a float value.
+    pub fn from_float(v: f32) -> Self {
+        Self(FixedPoint::from_float(
+            v.max(MIN_FONT_WEIGHT).min(MAX_FONT_WEIGHT),
+        ))
+    }
+
+    /// Return the bolder weight.
+    ///
+    /// See the table in:
+    /// https://drafts.csswg.org/css-fonts-4/#font-weight-numeric-values
+    pub fn bolder(self) -> Self {
+        let value = self.value();
+        if value < 350. {
+            return Self::NORMAL;
+        }
+        if value < 550. {
+            return Self::BOLD;
+        }
+        Self::from_float(value.max(900.))
+    }
+
+    /// Return the lighter weight.
+    ///
+    /// See the table in:
+    /// https://drafts.csswg.org/css-fonts-4/#font-weight-numeric-values
+    pub fn lighter(self) -> Self {
+        let value = self.value();
+        if value < 550. {
+            return Self::from_float(value.min(100.));
+        }
+        if value < 750. {
+            return Self::NORMAL;
+        }
+        Self::BOLD
     }
 }
 
@@ -85,79 +232,37 @@ impl ToAnimatedValue for FontWeight {
 #[cfg_attr(feature = "servo", derive(Serialize, Deserialize))]
 /// The computed value of font-size
 pub struct FontSize {
-    /// The size.
-    pub size: NonNegativeLength,
+    /// The computed size, that we use to compute ems etc. This accounts for
+    /// e.g., text-zoom.
+    pub computed_size: NonNegativeLength,
+    /// The actual used size. This is the computed font size, potentially
+    /// constrained by other factors like minimum font-size settings and so on.
+    #[css(skip)]
+    pub used_size: NonNegativeLength,
     /// If derived from a keyword, the keyword and additional transformations applied to it
     #[css(skip)]
     pub keyword_info: KeywordInfo,
 }
 
-impl FontWeight {
-    /// Value for normal
-    pub fn normal() -> Self {
-        FontWeight(400.)
-    }
-
-    /// Value for bold
-    pub fn bold() -> Self {
-        FontWeight(700.)
-    }
-
-    /// Convert from an Gecko weight
-    #[cfg(feature = "gecko")]
-    pub fn from_gecko_weight(weight: structs::FontWeight) -> Self {
-        // we allow a wider range of weights than is parseable
-        // because system fonts may provide custom values
-        let weight = unsafe { bindings::Gecko_FontWeight_ToFloat(weight) };
-        FontWeight(weight)
-    }
-
-    /// Weither this weight is bold
-    pub fn is_bold(&self) -> bool {
-        self.0 > 500.
-    }
-
-    /// Return the bolder weight.
-    ///
-    /// See the table in:
-    /// https://drafts.csswg.org/css-fonts-4/#font-weight-numeric-values
-    pub fn bolder(self) -> Self {
-        if self.0 < 350. {
-            FontWeight(400.)
-        } else if self.0 < 550. {
-            FontWeight(700.)
-        } else {
-            FontWeight(self.0.max(900.))
-        }
-    }
-
-    /// Return the lighter weight.
-    ///
-    /// See the table in:
-    /// https://drafts.csswg.org/css-fonts-4/#font-weight-numeric-values
-    pub fn lighter(self) -> Self {
-        if self.0 < 550. {
-            FontWeight(self.0.min(100.))
-        } else if self.0 < 750. {
-            FontWeight(400.)
-        } else {
-            FontWeight(700.)
-        }
-    }
-}
-
 impl FontSize {
     /// The actual computed font size.
     #[inline]
-    pub fn size(&self) -> Length {
-        self.size.0
+    pub fn computed_size(&self) -> Length {
+        self.computed_size.0
+    }
+
+    /// The actual used font size.
+    #[inline]
+    pub fn used_size(&self) -> Length {
+        self.used_size.0
     }
 
     #[inline]
     /// Get default value of font size.
     pub fn medium() -> Self {
         Self {
-            size: NonNegative(Length::new(specified::FONT_MEDIUM_PX)),
+            computed_size: NonNegative(Length::new(specified::FONT_MEDIUM_PX)),
+            used_size: NonNegative(Length::new(specified::FONT_MEDIUM_PX)),
             keyword_info: KeywordInfo::medium(),
         }
     }
@@ -168,13 +273,14 @@ impl ToAnimatedValue for FontSize {
 
     #[inline]
     fn to_animated_value(self) -> Self::AnimatedValue {
-        self.size.0
+        self.computed_size.0
     }
 
     #[inline]
     fn from_animated_value(animated: Self::AnimatedValue) -> Self {
         FontSize {
-            size: NonNegative(animated.clamp_to_non_negative()),
+            computed_size: NonNegative(animated.clamp_to_non_negative()),
+            used_size: NonNegative(animated.clamp_to_non_negative()),
             keyword_info: KeywordInfo::none(),
         }
     }
@@ -183,34 +289,122 @@ impl ToAnimatedValue for FontSize {
 #[derive(Clone, Debug, Eq, PartialEq, ToComputedValue, ToResolvedValue)]
 #[cfg_attr(feature = "servo", derive(Hash, MallocSizeOf, Serialize, Deserialize))]
 /// Specifies a prioritized list of font family names or generic family names.
+#[repr(C)]
 pub struct FontFamily {
     /// The actual list of family names.
     pub families: FontFamilyList,
     /// Whether this font-family came from a specified system-font.
     pub is_system_font: bool,
+    /// Whether this is the initial font-family that might react to language
+    /// changes.
+    pub is_initial: bool,
+}
+
+macro_rules! static_font_family {
+    ($ident:ident, $family:expr) => {
+        lazy_static! {
+            static ref $ident: FontFamily = FontFamily {
+                families: FontFamilyList {
+                    #[cfg(feature = "gecko")]
+                    list: crate::ArcSlice::from_iter_leaked(std::iter::once($family)),
+                    #[cfg(feature = "servo")]
+                    list: Box::new([$family]),
+                },
+                is_system_font: false,
+                is_initial: false,
+            };
+        }
+    };
 }
 
 impl FontFamily {
     #[inline]
     /// Get default font family as `serif` which is a generic font-family
     pub fn serif() -> Self {
-        FontFamily {
-            families: FontFamilyList::new(Box::new([SingleFontFamily::Generic(
-                GenericFontFamily::Serif,
-            )])),
-            is_system_font: false,
+        Self::generic(GenericFontFamily::Serif).clone()
+    }
+
+    /// Returns the font family for `-moz-bullet-font`.
+    #[cfg(feature = "gecko")]
+    pub(crate) fn moz_bullet() -> &'static Self {
+        static_font_family!(
+            MOZ_BULLET,
+            SingleFontFamily::FamilyName(FamilyName {
+                name: atom!("-moz-bullet-font"),
+                syntax: FontFamilyNameSyntax::Identifiers,
+            })
+        );
+
+        &*MOZ_BULLET
+    }
+
+    /// Returns a font family for a single system font.
+    #[cfg(feature = "gecko")]
+    pub fn for_system_font(name: &str) -> Self {
+        Self {
+            families: FontFamilyList {
+                list: crate::ArcSlice::from_iter(std::iter::once(SingleFontFamily::FamilyName(
+                    FamilyName {
+                        name: Atom::from(name),
+                        syntax: FontFamilyNameSyntax::Identifiers,
+                    },
+                ))),
+            },
+            is_system_font: true,
+            is_initial: false,
+        }
+    }
+
+    /// Returns a generic font family.
+    pub fn generic(generic: GenericFontFamily) -> &'static Self {
+        macro_rules! generic_font_family {
+            ($ident:ident, $family:ident) => {
+                static_font_family!(
+                    $ident,
+                    SingleFontFamily::Generic(GenericFontFamily::$family)
+                )
+            };
+        }
+
+        generic_font_family!(SERIF, Serif);
+        generic_font_family!(SANS_SERIF, SansSerif);
+        generic_font_family!(MONOSPACE, Monospace);
+        generic_font_family!(CURSIVE, Cursive);
+        generic_font_family!(FANTASY, Fantasy);
+        #[cfg(feature = "gecko")]
+        generic_font_family!(MOZ_EMOJI, MozEmoji);
+        generic_font_family!(SYSTEM_UI, SystemUi);
+
+        match generic {
+            GenericFontFamily::None => {
+                debug_assert!(false, "Bogus caller!");
+                &*SERIF
+            },
+            GenericFontFamily::Serif => &*SERIF,
+            GenericFontFamily::SansSerif => &*SANS_SERIF,
+            GenericFontFamily::Monospace => &*MONOSPACE,
+            GenericFontFamily::Cursive => &*CURSIVE,
+            GenericFontFamily::Fantasy => &*FANTASY,
+            #[cfg(feature = "gecko")]
+            GenericFontFamily::MozEmoji => &*MOZ_EMOJI,
+            GenericFontFamily::SystemUi => &*SYSTEM_UI,
         }
     }
 }
 
 #[cfg(feature = "gecko")]
 impl MallocSizeOf for FontFamily {
-    fn size_of(&self, _ops: &mut MallocSizeOfOps) -> usize {
-        // SharedFontList objects are generally shared from the pointer
-        // stored in the specified value. So only count this if the
-        // SharedFontList is unshared.
-        let shared_font_list = self.families.shared_font_list().get();
-        unsafe { bindings::Gecko_SharedFontList_SizeOfIncludingThisIfUnshared(shared_font_list) }
+    fn size_of(&self, ops: &mut MallocSizeOfOps) -> usize {
+        use malloc_size_of::MallocUnconditionalSizeOf;
+        // SharedFontList objects are generally measured from the pointer stored
+        // in the specified value. So only count this if the SharedFontList is
+        // unshared.
+        let shared_font_list = &self.families.list;
+        if shared_font_list.is_unique() {
+            shared_font_list.unconditional_size_of(ops)
+        } else {
+            0
+        }
     }
 }
 
@@ -220,7 +414,15 @@ impl ToCss for FontFamily {
         W: fmt::Write,
     {
         let mut iter = self.families.iter();
-        iter.next().unwrap().to_css(dest)?;
+        match iter.next() {
+            Some(f) => f.to_css(dest)?,
+            None => {
+                #[cfg(feature = "gecko")]
+                return return Ok(());
+                #[cfg(feature = "servo")]
+                unreachable!();
+            },
+        }
         for family in iter {
             dest.write_str(", ")?;
             family.to_css(dest)?;
@@ -229,16 +431,25 @@ impl ToCss for FontFamily {
     }
 }
 
+/// The name of a font family of choice.
 #[derive(
     Clone, Debug, Eq, Hash, MallocSizeOf, PartialEq, ToComputedValue, ToResolvedValue, ToShmem,
 )]
 #[cfg_attr(feature = "servo", derive(Deserialize, Serialize))]
-/// The name of a font family of choice
+#[repr(C)]
 pub struct FamilyName {
-    /// Name of the font family
+    /// Name of the font family.
     pub name: Atom,
-    /// Syntax of the font family
+    /// Syntax of the font family.
     pub syntax: FontFamilyNameSyntax,
+}
+
+#[cfg(feature = "gecko")]
+impl FamilyName {
+    fn is_known_icon_font_family(&self) -> bool {
+        use crate::gecko_bindings::bindings;
+        unsafe { bindings::Gecko_IsKnownIconFontFamily(self.name.as_ptr()) }
+    }
 }
 
 impl ToCss for FamilyName {
@@ -291,11 +502,13 @@ pub enum FontFamilyNameSyntax {
     Identifiers,
 }
 
+/// A set of faces that vary in weight, width or slope.
+/// cbindgen:derive-mut-casts=true
 #[derive(
     Clone, Debug, Eq, MallocSizeOf, PartialEq, ToCss, ToComputedValue, ToResolvedValue, ToShmem,
 )]
 #[cfg_attr(feature = "servo", derive(Deserialize, Serialize, Hash))]
-/// A set of faces that vary in weight, width or slope.
+#[repr(u8)]
 pub enum SingleFontFamily {
     /// The name of a font family of choice.
     FamilyName(FamilyName),
@@ -303,11 +516,22 @@ pub enum SingleFontFamily {
     Generic(GenericFontFamily),
 }
 
+fn system_ui_enabled(_: &ParserContext) -> bool {
+    #[cfg(feature = "gecko")]
+    return static_prefs::pref!("layout.css.system-ui.enabled");
+    #[cfg(feature = "servo")]
+    return false;
+}
+
 /// A generic font-family name.
 ///
 /// The order here is important, if you change it make sure that
 /// `gfxPlatformFontList.h`s ranged array and `gfxFontFamilyList`'s
 /// sSingleGenerics are updated as well.
+///
+/// NOTE(emilio): Should be u8, but it's a u32 because of ABI issues between GCC
+/// and LLVM see https://bugs.llvm.org/show_bug.cgi?id=44228 / bug 1600735 /
+/// bug 1726515.
 #[derive(
     Clone,
     Copy,
@@ -323,7 +547,7 @@ pub enum SingleFontFamily {
     ToShmem,
 )]
 #[cfg_attr(feature = "servo", derive(Deserialize, Serialize))]
-#[repr(u8)]
+#[repr(u32)]
 #[allow(missing_docs)]
 pub enum GenericFontFamily {
     /// No generic family specified, only for internal usage.
@@ -337,15 +561,34 @@ pub enum GenericFontFamily {
     Monospace,
     Cursive,
     Fantasy,
+    #[parse(condition = "system_ui_enabled")]
+    SystemUi,
     /// An internal value for emoji font selection.
     #[css(skip)]
     #[cfg(feature = "gecko")]
     MozEmoji,
 }
 
-impl SingleFontFamily {
+impl GenericFontFamily {
+    /// When we disallow websites to override fonts, we ignore some generic
+    /// families that the website might specify, since they're not configured by
+    /// the user. See bug 789788 and bug 1730098.
+    #[cfg(feature = "gecko")]
+    pub(crate) fn valid_for_user_font_prioritization(self) -> bool {
+        match self {
+            Self::None | Self::Fantasy | Self::Cursive | Self::SystemUi | Self::MozEmoji => false,
+
+            Self::Serif | Self::SansSerif | Self::Monospace => true,
+        }
+    }
+}
+
+impl Parse for SingleFontFamily {
     /// Parse a font-family value.
-    pub fn parse<'i, 't>(input: &mut Parser<'i, 't>) -> Result<Self, ParseError<'i>> {
+    fn parse<'i, 't>(
+        context: &ParserContext,
+        input: &mut Parser<'i, 't>,
+    ) -> Result<Self, ParseError<'i>> {
         if let Ok(value) = input.try_parse(|i| i.expect_string_cloned()) {
             return Ok(SingleFontFamily::FamilyName(FamilyName {
                 name: Atom::from(&*value),
@@ -353,11 +596,11 @@ impl SingleFontFamily {
             }));
         }
 
-        let first_ident = input.expect_ident_cloned()?;
-        if let Ok(generic) = GenericFontFamily::from_ident(&first_ident) {
+        if let Ok(generic) = input.try_parse(|i| GenericFontFamily::parse(context, i)) {
             return Ok(SingleFontFamily::Generic(generic));
         }
 
+        let first_ident = input.expect_ident_cloned()?;
         let reserved = match_ignore_ascii_case! { &first_ident,
             // https://drafts.csswg.org/css-fonts/#propdef-font-family
             // "Font family names that happen to be the same as a keyword value
@@ -400,8 +643,10 @@ impl SingleFontFamily {
             syntax,
         }))
     }
+}
 
-    #[cfg(feature = "servo")]
+#[cfg(feature = "servo")]
+impl SingleFontFamily {
     /// Get the corresponding font-family with Atom
     pub fn from_atom(input: Atom) -> SingleFontFamily {
         match input {
@@ -410,6 +655,7 @@ impl SingleFontFamily {
             atom!("cursive") => return SingleFontFamily::Generic(GenericFontFamily::Cursive),
             atom!("fantasy") => return SingleFontFamily::Generic(GenericFontFamily::Fantasy),
             atom!("monospace") => return SingleFontFamily::Generic(GenericFontFamily::Monospace),
+            atom!("system-ui") => return SingleFontFamily::Generic(GenericFontFamily::SystemUi),
             _ => {},
         }
 
@@ -419,6 +665,7 @@ impl SingleFontFamily {
             "cursive" => return SingleFontFamily::Generic(GenericFontFamily::Cursive),
             "fantasy" => return SingleFontFamily::Generic(GenericFontFamily::Fantasy),
             "monospace" => return SingleFontFamily::Generic(GenericFontFamily::Monospace),
+            "system-ui" => return SingleFontFamily::Generic(GenericFontFamily::SystemUi),
             _ => {}
         }
 
@@ -429,22 +676,18 @@ impl SingleFontFamily {
             syntax: FontFamilyNameSyntax::Quoted,
         })
     }
-
-    #[cfg(feature = "gecko")]
-    /// Get the corresponding font-family with family name
-    fn from_font_family_name(family: &structs::FontFamilyName) -> SingleFontFamily {
-        if family.mName.mRawPtr.is_null() {
-            debug_assert_ne!(family.mGeneric, GenericFontFamily::None);
-            return SingleFontFamily::Generic(family.mGeneric);
-        }
-        let name = unsafe { Atom::from_raw(family.mName.mRawPtr) };
-        SingleFontFamily::FamilyName(FamilyName {
-            name,
-            syntax: family.mSyntax,
-        })
-    }
 }
 
+/// A list of font families.
+#[cfg(feature = "gecko")]
+#[derive(Clone, Debug, ToComputedValue, ToResolvedValue, ToShmem, PartialEq, Eq)]
+#[repr(C)]
+pub struct FontFamilyList {
+    /// The actual list of font families specified.
+    pub list: crate::ArcSlice<SingleFontFamily>,
+}
+
+/// A list of font families.
 #[cfg(feature = "servo")]
 #[derive(
     Clone,
@@ -459,115 +702,78 @@ impl SingleFontFamily {
     ToResolvedValue,
     ToShmem,
 )]
-/// A list of SingleFontFamily
-pub struct FontFamilyList(Box<[SingleFontFamily]>);
-
-#[cfg(feature = "gecko")]
-#[derive(Clone, Debug, ToComputedValue, ToResolvedValue)]
-/// A list of SingleFontFamily
-pub enum FontFamilyList {
-    /// A strong reference to a Gecko SharedFontList object.
-    SharedFontList(
-        #[compute(no_field_bound)]
-        #[resolve(no_field_bound)]
-        RefPtr<structs::SharedFontList>,
-    ),
-    /// A font-family generic ID.
-    Generic(GenericFontFamily),
+pub struct FontFamilyList {
+    /// The actual list of font families specified.
+    pub list: Box<[SingleFontFamily]>,
 }
-
-#[cfg(feature = "gecko")]
-impl ToShmem for FontFamilyList {
-    fn to_shmem(&self, _builder: &mut SharedMemoryBuilder) -> to_shmem::Result<Self> {
-        // In practice, the only SharedFontList objects we create from shared
-        // style sheets are ones with a single generic entry.
-        Ok(ManuallyDrop::new(match *self {
-            FontFamilyList::SharedFontList(ref r) => {
-                if !(r.mNames.len() == 1 && r.mNames[0].mName.mRawPtr.is_null()) {
-                    return Err(String::from(
-                        "ToShmem failed for FontFamilyList: cannot handle non-generic families",
-                    ));
-                }
-                FontFamilyList::Generic(r.mNames[0].mGeneric)
-            },
-            FontFamilyList::Generic(t) => FontFamilyList::Generic(t),
-        }))
-    }
-}
-
-#[cfg(feature = "gecko")]
-impl PartialEq for FontFamilyList {
-    fn eq(&self, other: &FontFamilyList) -> bool {
-        let self_list = self.shared_font_list();
-        let other_list = other.shared_font_list();
-
-        if self_list.mNames.len() != other_list.mNames.len() {
-            return false;
-        }
-        for (a, b) in self_list.mNames.iter().zip(other_list.mNames.iter()) {
-            if a.mSyntax != b.mSyntax ||
-                a.mName.mRawPtr != b.mName.mRawPtr ||
-                a.mGeneric != b.mGeneric
-            {
-                return false;
-            }
-        }
-        true
-    }
-}
-
-#[cfg(feature = "gecko")]
-impl Eq for FontFamilyList {}
 
 impl FontFamilyList {
-    /// Return FontFamilyList with a vector of SingleFontFamily
-    #[cfg(feature = "servo")]
-    pub fn new(families: Box<[SingleFontFamily]>) -> FontFamilyList {
-        FontFamilyList(families)
+    /// Return iterator of SingleFontFamily
+    pub fn iter(&self) -> impl Iterator<Item = &SingleFontFamily> {
+        self.list.iter()
     }
 
-    /// Return FontFamilyList with a vector of SingleFontFamily
+    /// If there's a generic font family on the list which is suitable for user
+    /// font prioritization, then move it ahead of the other families in the list,
+    /// except for any families known to be ligature-based icon fonts, where using a
+    /// generic instead of the site's specified font may cause substantial breakage.
+    /// If no suitable generic is found in the list, insert the default generic ahead
+    /// of all the listed families except for known ligature-based icon fonts.
     #[cfg(feature = "gecko")]
-    pub fn new(families: Box<[SingleFontFamily]>) -> FontFamilyList {
-        let fontlist;
-        let names;
-        unsafe {
-            fontlist = bindings::Gecko_SharedFontList_Create();
-            names = &mut (*fontlist).mNames;
-            names.ensure_capacity(families.len());
-        };
+    pub(crate) fn prioritize_first_generic_or_prepend(&mut self, generic: GenericFontFamily) {
+        let mut index_of_first_generic = None;
+        let mut target_index = None;
 
-        for family in families.iter() {
-            match *family {
-                SingleFontFamily::FamilyName(ref f) => unsafe {
-                    bindings::Gecko_nsTArray_FontFamilyName_AppendNamed(
-                        names,
-                        f.name.as_ptr(),
-                        f.syntax,
-                    );
+        for (i, f) in self.iter().enumerate() {
+            match &*f {
+                SingleFontFamily::Generic(f) => {
+                    if index_of_first_generic.is_none() && f.valid_for_user_font_prioritization() {
+                        // If we haven't found a target position, there's nothing to do;
+                        // this entry is already ahead of everything except any whitelisted
+                        // icon fonts.
+                        if target_index.is_none() {
+                            return;
+                        }
+                        index_of_first_generic = Some(i);
+                        break;
+                    }
+                    // A non-prioritized generic (e.g. cursive, fantasy) becomes the target
+                    // position for prioritization, just like arbitrary named families.
+                    if target_index.is_none() {
+                        target_index = Some(i);
+                    }
                 },
-                SingleFontFamily::Generic(family) => unsafe {
-                    bindings::Gecko_nsTArray_FontFamilyName_AppendGeneric(names, family);
+                SingleFontFamily::FamilyName(fam) => {
+                    // Target position for the first generic is in front of the first
+                    // non-whitelisted icon font family we find.
+                    if target_index.is_none() && !fam.is_known_icon_font_family() {
+                        target_index = Some(i);
+                    }
                 },
             }
         }
 
-        FontFamilyList::SharedFontList(unsafe { RefPtr::from_addrefed(fontlist) })
-    }
+        let mut new_list = self.list.iter().cloned().collect::<Vec<_>>();
+        let first_generic = match index_of_first_generic {
+            Some(i) => new_list.remove(i),
+            None => SingleFontFamily::Generic(generic),
+        };
 
-    /// Return iterator of SingleFontFamily
-    #[cfg(feature = "servo")]
-    pub fn iter(&self) -> slice::Iter<SingleFontFamily> {
-        self.0.iter()
-    }
-
-    /// Return iterator of SingleFontFamily
-    #[cfg(feature = "gecko")]
-    pub fn iter(&self) -> FontFamilyNameIter {
-        FontFamilyNameIter {
-            names: &self.shared_font_list().mNames,
-            cur: 0,
+        if let Some(i) = target_index {
+            new_list.insert(i, first_generic);
+        } else {
+            new_list.push(first_generic);
         }
+        self.list = crate::ArcSlice::from_iter(new_list.into_iter());
+    }
+
+    /// Returns whether we need to prioritize user fonts.
+    #[cfg(feature = "gecko")]
+    pub(crate) fn needs_user_font_prioritization(&self) -> bool {
+        self.iter().next().map_or(true, |f| match f {
+            SingleFontFamily::Generic(f) => !f.valid_for_user_font_prioritization(),
+            _ => true,
+        })
     }
 
     /// Return the generic ID if it is a single generic font
@@ -575,72 +781,15 @@ impl FontFamilyList {
         let mut iter = self.iter();
         if let Some(SingleFontFamily::Generic(f)) = iter.next() {
             if iter.next().is_none() {
-                return Some(f.clone());
+                return Some(*f);
             }
         }
         None
     }
-
-    /// Return a reference to the Gecko SharedFontList.
-    #[cfg(feature = "gecko")]
-    pub fn shared_font_list(&self) -> &RefPtr<structs::SharedFontList> {
-        match *self {
-            FontFamilyList::SharedFontList(ref r) => r,
-            FontFamilyList::Generic(t) => {
-                unsafe {
-                    // TODO(heycam): Should really add StaticRefPtr sugar.
-                    let index = t as usize;
-                    mem::transmute::<
-                        &structs::StaticRefPtr<structs::SharedFontList>,
-                        &RefPtr<structs::SharedFontList>,
-                    >(&structs::SharedFontList_sSingleGenerics[index])
-                }
-            },
-        }
-    }
-}
-
-/// Iterator of FontFamily
-#[cfg(feature = "gecko")]
-pub struct FontFamilyNameIter<'a> {
-    names: &'a structs::nsTArray<structs::FontFamilyName>,
-    cur: usize,
-}
-
-#[cfg(feature = "gecko")]
-impl<'a> Iterator for FontFamilyNameIter<'a> {
-    type Item = SingleFontFamily;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.cur < self.names.len() {
-            let item = SingleFontFamily::from_font_family_name(&self.names[self.cur]);
-            self.cur += 1;
-            Some(item)
-        } else {
-            None
-        }
-    }
 }
 
 /// Preserve the readability of text when font fallback occurs
-#[derive(
-    Animate,
-    Clone,
-    ComputeSquaredDistance,
-    Copy,
-    Debug,
-    MallocSizeOf,
-    PartialEq,
-    ToCss,
-    ToResolvedValue,
-)]
-pub enum FontSizeAdjust {
-    #[animation(error)]
-    /// None variant
-    None,
-    /// Number variant
-    Number(CSSFloat),
-}
+pub type FontSizeAdjust = generics::GenericFontSizeAdjust<NonNegativeNumber>;
 
 impl FontSizeAdjust {
     #[inline]
@@ -648,61 +797,7 @@ impl FontSizeAdjust {
     pub fn none() -> Self {
         FontSizeAdjust::None
     }
-
-    /// Get font-size-adjust with float number
-    pub fn from_gecko_adjust(gecko: f32) -> Self {
-        if gecko == -1.0 {
-            FontSizeAdjust::None
-        } else {
-            FontSizeAdjust::Number(gecko)
-        }
-    }
 }
-
-impl ToAnimatedZero for FontSizeAdjust {
-    #[inline]
-    // FIXME(emilio): why?
-    fn to_animated_zero(&self) -> Result<Self, ()> {
-        Err(())
-    }
-}
-
-impl ToAnimatedValue for FontSizeAdjust {
-    type AnimatedValue = Self;
-
-    #[inline]
-    fn to_animated_value(self) -> Self {
-        self
-    }
-
-    #[inline]
-    fn from_animated_value(animated: Self::AnimatedValue) -> Self {
-        match animated {
-            FontSizeAdjust::Number(number) => FontSizeAdjust::Number(number.max(0.)),
-            _ => animated,
-        }
-    }
-}
-
-/// Use VariantAlternatesList as computed type of FontVariantAlternates
-pub type FontVariantAlternates = specified::VariantAlternatesList;
-
-impl FontVariantAlternates {
-    /// Get initial value with VariantAlternatesList
-    #[inline]
-    pub fn get_initial_value() -> Self {
-        Self::default()
-    }
-}
-
-/// Use VariantEastAsian as computed type of FontVariantEastAsian
-pub type FontVariantEastAsian = specified::VariantEastAsian;
-
-/// Use VariantLigatures as computed type of FontVariantLigatures
-pub type FontVariantLigatures = specified::VariantLigatures;
-
-/// Use VariantNumeric as computed type of FontVariantNumeric
-pub type FontVariantNumeric = specified::VariantNumeric;
 
 /// Use FontSettings as computed type of FontFeatureSettings.
 pub type FontFeatureSettings = FontSettings<FeatureTagValue<Integer>>;
@@ -710,18 +805,80 @@ pub type FontFeatureSettings = FontSettings<FeatureTagValue<Integer>>;
 /// The computed value for font-variation-settings.
 pub type FontVariationSettings = FontSettings<VariationValue<Number>>;
 
-/// font-language-override can only have a single three-letter
+// The computed value of font-{feature,variation}-settings discards values
+// with duplicate tags, keeping only the last occurrence of each tag.
+fn dedup_font_settings<T>(settings_list: &mut Vec<T>)
+where
+    T: TaggedFontValue,
+{
+    if settings_list.len() > 1 {
+        settings_list.sort_by_key(|k| k.tag().0);
+        // dedup() keeps the first of any duplicates, but we want the last,
+        // so we implement it manually here.
+        let mut prev_tag = settings_list.last().unwrap().tag();
+        for i in (0..settings_list.len() - 1).rev() {
+            let cur_tag = settings_list[i].tag();
+            if cur_tag == prev_tag {
+                settings_list.remove(i);
+            }
+            prev_tag = cur_tag;
+        }
+    }
+}
+
+impl<T> ToComputedValue for FontSettings<T>
+where
+    T: ToComputedValue,
+    <T as ToComputedValue>::ComputedValue: TaggedFontValue,
+{
+    type ComputedValue = FontSettings<T::ComputedValue>;
+
+    fn to_computed_value(&self, context: &Context) -> Self::ComputedValue {
+        let mut v = self
+            .0
+            .iter()
+            .map(|item| item.to_computed_value(context))
+            .collect::<Vec<_>>();
+        dedup_font_settings(&mut v);
+        FontSettings(v.into_boxed_slice())
+    }
+
+    fn from_computed_value(computed: &Self::ComputedValue) -> Self {
+        Self(
+            computed
+                .0
+                .iter()
+                .map(T::from_computed_value)
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        )
+    }
+}
+
+/// font-language-override can only have a single 1-4 ASCII character
 /// OpenType "language system" tag, so we should be able to compute
 /// it and store it as a 32-bit integer
 /// (see http://www.microsoft.com/typography/otspec/languagetags.htm).
-#[derive(Clone, Copy, Debug, Eq, MallocSizeOf, PartialEq, ToResolvedValue)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Eq,
+    MallocSizeOf,
+    PartialEq,
+    SpecifiedValueInfo,
+    ToComputedValue,
+    ToResolvedValue,
+    ToShmem,
+)]
 #[repr(C)]
+#[value_info(other_values = "normal")]
 pub struct FontLanguageOverride(pub u32);
 
 impl FontLanguageOverride {
     #[inline]
     /// Get computed default value of `font-language-override` with 0
-    pub fn zero() -> FontLanguageOverride {
+    pub fn normal() -> FontLanguageOverride {
         FontLanguageOverride(0)
     }
 
@@ -729,30 +886,13 @@ impl FontLanguageOverride {
     #[inline]
     pub(crate) fn to_str(self, storage: &mut [u8; 4]) -> &str {
         *storage = u32::to_be_bytes(self.0);
-        // Safe because we ensure it's ASCII during computing
+        // Safe because we ensure it's ASCII during parsing
         let slice = if cfg!(debug_assertions) {
             std::str::from_utf8(&storage[..]).unwrap()
         } else {
             unsafe { std::str::from_utf8_unchecked(&storage[..]) }
         };
         slice.trim_end()
-    }
-
-    /// Parses a str, return `Self::zero()` if the input isn't a valid OpenType
-    /// "language system" tag.
-    #[inline]
-    pub fn from_str(lang: &str) -> Self {
-        if lang.is_empty() || lang.len() > 4 {
-            return Self::zero();
-        }
-        let mut bytes = [b' '; 4];
-        for (byte, lang_byte) in bytes.iter_mut().zip(lang.as_bytes()) {
-            if !lang_byte.is_ascii() {
-                return Self::zero();
-            }
-            *byte = *lang_byte;
-        }
-        Self(u32::from_be_bytes(bytes))
     }
 
     /// Unsafe because `Self::to_str` requires the value to represent a UTF-8
@@ -801,7 +941,7 @@ impl ToComputedValue for specified::MozScriptMinSize {
         match self.0 {
             NoCalcLength::FontRelative(value) => value.to_computed_value(cx, base_size),
             NoCalcLength::ServoCharacterWidth(value) => {
-                value.to_computed_value(base_size.resolve(cx))
+                value.to_computed_value(base_size.resolve(cx).computed_size())
             },
             ref l => l.to_computed_value(cx),
         }
@@ -828,14 +968,14 @@ impl ToComputedValue for specified::MathDepth {
                 let parent = cx.builder.get_parent_font().clone_math_depth() as i32;
                 let style = cx.builder.get_parent_font().clone_math_style();
                 if style == MathStyleValue::Compact {
-                    parent + 1
+                    parent.saturating_add(1)
                 } else {
                     parent
                 }
             },
             specified::MathDepth::Add(rel) => {
                 let parent = cx.builder.get_parent_font().clone_math_depth();
-                parent as i32 + rel.to_computed_value(cx)
+                (parent as i32).saturating_add(rel.to_computed_value(cx))
             },
             specified::MathDepth::Absolute(abs) => abs.to_computed_value(cx),
         };
@@ -848,76 +988,82 @@ impl ToComputedValue for specified::MathDepth {
     }
 }
 
-/// A wrapper over an `Angle`, that handles clamping to the appropriate range
-/// for `font-style` animation.
-#[derive(Clone, Copy, Debug, MallocSizeOf, PartialEq, ToCss, ToResolvedValue)]
-#[cfg_attr(feature = "servo", derive(Deserialize, Serialize))]
-pub struct FontStyleAngle(pub Angle);
+/// - Use a signed 8.8 fixed-point value (representable range -128.0..128)
+///
+/// Values of <angle> below -90 or above 90 not permitted, so we use out of
+/// range values to represent normal | oblique
+pub const FONT_STYLE_FRACTION_BITS: u16 = 8;
 
-impl ToAnimatedValue for FontStyleAngle {
-    type AnimatedValue = Angle;
-
-    #[inline]
-    fn to_animated_value(self) -> Self::AnimatedValue {
-        self.0
-    }
-
-    #[inline]
-    fn from_animated_value(animated: Self::AnimatedValue) -> Self {
-        FontStyleAngle(Angle::from_degrees(
-            animated
-                .degrees()
-                .min(specified::FONT_STYLE_OBLIQUE_MAX_ANGLE_DEGREES)
-                .max(specified::FONT_STYLE_OBLIQUE_MIN_ANGLE_DEGREES),
-        ))
-    }
-}
-
-impl Hash for FontStyleAngle {
-    fn hash<H: Hasher>(&self, hasher: &mut H) {
-        hasher.write_u64((self.0.degrees() * 10000.).trunc() as u64);
-    }
-}
+/// This is an alias which is useful mostly as a cbindgen / C++ inference
+/// workaround.
+pub type FontStyleFixedPoint = FixedPoint<i16, FONT_STYLE_FRACTION_BITS>;
 
 /// The computed value of `font-style`.
 ///
-/// FIXME(emilio): Angle should be a custom type to handle clamping during
-/// animation.
-pub type FontStyle = generics::FontStyle<FontStyleAngle>;
+/// - Define out of range values min value (-128.0) as meaning 'normal'
+/// - Define max value (127.99609375) as 'italic'
+/// - Other values represent 'oblique <angle>'
+/// - Note that 'oblique 0deg' is distinct from 'normal' (should it be?)
+///
+/// cbindgen:derive-lt
+/// cbindgen:derive-lte
+/// cbindgen:derive-gt
+/// cbindgen:derive-gte
+#[derive(
+    Clone,
+    ComputeSquaredDistance,
+    Copy,
+    Debug,
+    Eq,
+    Hash,
+    MallocSizeOf,
+    PartialEq,
+    PartialOrd,
+    ToResolvedValue,
+)]
+#[cfg_attr(feature = "servo", derive(Deserialize, Serialize))]
+#[repr(C)]
+pub struct FontStyle(FontStyleFixedPoint);
 
 impl FontStyle {
+    /// The normal keyword.
+    pub const NORMAL: FontStyle = FontStyle(FontStyleFixedPoint {
+        value: 100 << FONT_STYLE_FRACTION_BITS,
+    });
+    /// The italic keyword.
+    pub const ITALIC: FontStyle = FontStyle(FontStyleFixedPoint {
+        value: 101 << FONT_STYLE_FRACTION_BITS,
+    });
+
+    /// The default angle for `font-style: oblique`.
+    /// See also https://github.com/w3c/csswg-drafts/issues/2295
+    pub const DEFAULT_OBLIQUE_DEGREES: i16 = 14;
+
+    /// The `oblique` keyword with the default degrees.
+    pub const OBLIQUE: FontStyle = FontStyle(FontStyleFixedPoint {
+        value: Self::DEFAULT_OBLIQUE_DEGREES << FONT_STYLE_FRACTION_BITS,
+    });
+
     /// The `normal` value.
     #[inline]
     pub fn normal() -> Self {
-        generics::FontStyle::Normal
+        Self::NORMAL
     }
 
-    /// The default angle for font-style: oblique. This is 20deg per spec:
-    ///
-    /// https://drafts.csswg.org/css-fonts-4/#valdef-font-style-oblique-angle
-    #[inline]
-    pub fn default_angle() -> FontStyleAngle {
-        FontStyleAngle(Angle::from_degrees(
-            specified::DEFAULT_FONT_STYLE_OBLIQUE_ANGLE_DEGREES,
+    /// Returns the oblique angle for this style.
+    pub fn oblique(degrees: f32) -> Self {
+        Self(FixedPoint::from_float(
+            degrees
+                .max(specified::FONT_STYLE_OBLIQUE_MIN_ANGLE_DEGREES)
+                .min(specified::FONT_STYLE_OBLIQUE_MAX_ANGLE_DEGREES),
         ))
     }
 
-    /// Get the font style from Gecko's nsFont struct.
-    #[cfg(feature = "gecko")]
-    pub fn from_gecko(style: structs::FontSlantStyle) -> Self {
-        let mut angle = 0.;
-        let mut italic = false;
-        let mut normal = false;
-        unsafe {
-            bindings::Gecko_FontSlantStyle_Get(style, &mut normal, &mut italic, &mut angle);
-        }
-        if normal {
-            return generics::FontStyle::Normal;
-        }
-        if italic {
-            return generics::FontStyle::Italic;
-        }
-        generics::FontStyle::Oblique(FontStyleAngle(Angle::from_degrees(angle)))
+    /// Returns the oblique angle for this style.
+    pub fn oblique_degrees(&self) -> f32 {
+        debug_assert_ne!(*self, Self::NORMAL);
+        debug_assert_ne!(*self, Self::ITALIC);
+        self.0.to_float()
     }
 }
 
@@ -926,43 +1072,200 @@ impl ToCss for FontStyle {
     where
         W: fmt::Write,
     {
-        match *self {
-            generics::FontStyle::Normal => dest.write_str("normal"),
-            generics::FontStyle::Italic => dest.write_str("italic"),
+        if *self == Self::NORMAL {
+            return dest.write_str("normal");
+        }
+        if *self == Self::ITALIC {
+            return dest.write_str("italic");
+        }
+        if *self == Self::OBLIQUE {
+            return dest.write_str("oblique");
+        }
+        dest.write_str("oblique ")?;
+        let angle = Angle::from_degrees(self.oblique_degrees());
+        angle.to_css(dest)?;
+        Ok(())
+    }
+}
+
+impl ToAnimatedValue for FontStyle {
+    type AnimatedValue = generics::FontStyle<Angle>;
+
+    #[inline]
+    fn to_animated_value(self) -> Self::AnimatedValue {
+        if self == Self::NORMAL {
+            // This allows us to animate between normal and oblique values. Per spec,
+            // https://drafts.csswg.org/css-fonts-4/#font-style-prop:
+            //   Animation type: by computed value type; 'normal' animates as 'oblique 0deg'
+            return generics::FontStyle::Oblique(Angle::from_degrees(0.0));
+        }
+        if self == Self::ITALIC {
+            return generics::FontStyle::Italic;
+        }
+        generics::FontStyle::Oblique(Angle::from_degrees(self.oblique_degrees()))
+    }
+
+    #[inline]
+    fn from_animated_value(animated: Self::AnimatedValue) -> Self {
+        match animated {
+            generics::FontStyle::Normal => Self::NORMAL,
+            generics::FontStyle::Italic => Self::ITALIC,
             generics::FontStyle::Oblique(ref angle) => {
-                dest.write_str("oblique")?;
-                // Use `degrees` instead of just comparing Angle because
-                // `degrees` can return slightly different values due to
-                // floating point conversions.
-                if angle.0.degrees() != Self::default_angle().0.degrees() {
-                    dest.write_char(' ')?;
-                    angle.to_css(dest)?;
+                if angle.degrees() == 0.0 {
+                    // Reverse the conversion done in to_animated_value()
+                    Self::NORMAL
+                } else {
+                    Self::oblique(angle.degrees())
                 }
-                Ok(())
             },
         }
     }
 }
 
+/// font-stretch is a percentage relative to normal.
+///
+/// We use an unsigned 10.6 fixed-point value (range 0.0 - 1023.984375)
+///
+/// We arbitrarily limit here to 1000%. (If that becomes a problem, we could
+/// reduce the number of fractional bits and increase the limit.)
+pub const FONT_STRETCH_FRACTION_BITS: u16 = 6;
+
+/// This is an alias which is useful mostly as a cbindgen / C++ inference
+/// workaround.
+pub type FontStretchFixedPoint = FixedPoint<u16, FONT_STRETCH_FRACTION_BITS>;
+
 /// A value for the font-stretch property per:
 ///
 /// https://drafts.csswg.org/css-fonts-4/#propdef-font-stretch
+///
+/// cbindgen:derive-lt
+/// cbindgen:derive-lte
+/// cbindgen:derive-gt
+/// cbindgen:derive-gte
 #[derive(
-    Clone, ComputeSquaredDistance, Copy, Debug, MallocSizeOf, PartialEq, ToCss, ToResolvedValue,
+    Clone, ComputeSquaredDistance, Copy, Debug, MallocSizeOf, PartialEq, PartialOrd, ToResolvedValue,
 )]
-#[cfg_attr(feature = "servo", derive(Deserialize, Serialize))]
-pub struct FontStretch(pub NonNegativePercentage);
+#[cfg_attr(feature = "servo", derive(Deserialize, Hash, Serialize))]
+#[repr(C)]
+pub struct FontStretch(pub FontStretchFixedPoint);
 
 impl FontStretch {
+    /// The fraction bits, as an easy-to-access-constant.
+    pub const FRACTION_BITS: u16 = FONT_STRETCH_FRACTION_BITS;
+    /// 0.5 in our floating point representation.
+    pub const HALF: u16 = 1 << (Self::FRACTION_BITS - 1);
+
+    /// The `ultra-condensed` keyword.
+    pub const ULTRA_CONDENSED: FontStretch = FontStretch(FontStretchFixedPoint {
+        value: 50 << Self::FRACTION_BITS,
+    });
+    /// The `extra-condensed` keyword.
+    pub const EXTRA_CONDENSED: FontStretch = FontStretch(FontStretchFixedPoint {
+        value: (62 << Self::FRACTION_BITS) + Self::HALF,
+    });
+    /// The `condensed` keyword.
+    pub const CONDENSED: FontStretch = FontStretch(FontStretchFixedPoint {
+        value: 75 << Self::FRACTION_BITS,
+    });
+    /// The `semi-condensed` keyword.
+    pub const SEMI_CONDENSED: FontStretch = FontStretch(FontStretchFixedPoint {
+        value: (87 << Self::FRACTION_BITS) + Self::HALF,
+    });
+    /// The `normal` keyword.
+    pub const NORMAL: FontStretch = FontStretch(FontStretchFixedPoint {
+        value: 100 << Self::FRACTION_BITS,
+    });
+    /// The `semi-expanded` keyword.
+    pub const SEMI_EXPANDED: FontStretch = FontStretch(FontStretchFixedPoint {
+        value: (112 << Self::FRACTION_BITS) + Self::HALF,
+    });
+    /// The `expanded` keyword.
+    pub const EXPANDED: FontStretch = FontStretch(FontStretchFixedPoint {
+        value: 125 << Self::FRACTION_BITS,
+    });
+    /// The `extra-expanded` keyword.
+    pub const EXTRA_EXPANDED: FontStretch = FontStretch(FontStretchFixedPoint {
+        value: 150 << Self::FRACTION_BITS,
+    });
+    /// The `ultra-expanded` keyword.
+    pub const ULTRA_EXPANDED: FontStretch = FontStretch(FontStretchFixedPoint {
+        value: 200 << Self::FRACTION_BITS,
+    });
+
     /// 100%
     pub fn hundred() -> Self {
-        FontStretch(NonNegativePercentage::hundred())
+        Self::NORMAL
     }
 
-    /// The float value of the percentage
+    /// Converts to a computed percentage.
     #[inline]
-    pub fn value(&self) -> CSSFloat {
-        ((self.0).0).0
+    pub fn to_percentage(&self) -> Percentage {
+        Percentage(self.0.to_float() / 100.0)
+    }
+
+    /// Converts from a computed percentage value.
+    pub fn from_percentage(p: f32) -> Self {
+        Self(FixedPoint::from_float((p * 100.).max(0.0).min(1000.0)))
+    }
+
+    /// Returns a relevant stretch value from a keyword.
+    /// https://drafts.csswg.org/css-fonts-4/#font-stretch-prop
+    pub fn from_keyword(kw: specified::FontStretchKeyword) -> Self {
+        use specified::FontStretchKeyword::*;
+        match kw {
+            UltraCondensed => Self::ULTRA_CONDENSED,
+            ExtraCondensed => Self::EXTRA_CONDENSED,
+            Condensed => Self::CONDENSED,
+            SemiCondensed => Self::SEMI_CONDENSED,
+            Normal => Self::NORMAL,
+            SemiExpanded => Self::SEMI_EXPANDED,
+            Expanded => Self::EXPANDED,
+            ExtraExpanded => Self::EXTRA_EXPANDED,
+            UltraExpanded => Self::ULTRA_EXPANDED,
+        }
+    }
+
+    /// Returns the stretch keyword if we map to one of the relevant values.
+    pub fn as_keyword(&self) -> Option<specified::FontStretchKeyword> {
+        use specified::FontStretchKeyword::*;
+        // TODO: Can we use match here?
+        if *self == Self::ULTRA_CONDENSED {
+            return Some(UltraCondensed);
+        }
+        if *self == Self::EXTRA_CONDENSED {
+            return Some(ExtraCondensed);
+        }
+        if *self == Self::CONDENSED {
+            return Some(Condensed);
+        }
+        if *self == Self::SEMI_CONDENSED {
+            return Some(SemiCondensed);
+        }
+        if *self == Self::NORMAL {
+            return Some(Normal);
+        }
+        if *self == Self::SEMI_EXPANDED {
+            return Some(SemiExpanded);
+        }
+        if *self == Self::EXPANDED {
+            return Some(Expanded);
+        }
+        if *self == Self::EXTRA_EXPANDED {
+            return Some(ExtraExpanded);
+        }
+        if *self == Self::ULTRA_EXPANDED {
+            return Some(UltraExpanded);
+        }
+        None
+    }
+}
+
+impl ToCss for FontStretch {
+    fn to_css<W>(&self, dest: &mut CssWriter<W>) -> fmt::Result
+    where
+        W: fmt::Write,
+    {
+        self.to_percentage().to_css(dest)
     }
 }
 
@@ -971,17 +1274,11 @@ impl ToAnimatedValue for FontStretch {
 
     #[inline]
     fn to_animated_value(self) -> Self::AnimatedValue {
-        self.0.to_animated_value()
+        self.to_percentage()
     }
 
     #[inline]
     fn from_animated_value(animated: Self::AnimatedValue) -> Self {
-        FontStretch(NonNegativePercentage::from_animated_value(animated))
-    }
-}
-
-impl Hash for FontStretch {
-    fn hash<H: Hasher>(&self, hasher: &mut H) {
-        hasher.write_u64((self.value() * 10000.).trunc() as u64);
+        Self::from_percentage(animated.0)
     }
 }

@@ -2,6 +2,28 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
+use std::cell::{Cell, RefCell};
+use std::os::raw::c_void;
+use std::ptr::{self, NonNull};
+use std::rc::Rc;
+use std::slice;
+
+use dom_struct::dom_struct;
+use js::glue::{
+    CreateReadableStreamUnderlyingSource, DeleteReadableStreamUnderlyingSource,
+    ReadableStreamUnderlyingSourceTraps,
+};
+use js::jsapi::{
+    AutoRequireNoGC, HandleObject, HandleValue, Heap, IsReadableStream, JSContext, JSObject,
+    JS_GetArrayBufferViewData, NewReadableExternalSourceStreamObject, ReadableStreamClose,
+    ReadableStreamDefaultReaderRead, ReadableStreamError, ReadableStreamGetReader,
+    ReadableStreamIsDisturbed, ReadableStreamIsLocked, ReadableStreamIsReadable,
+    ReadableStreamReaderMode, ReadableStreamReaderReleaseLock, ReadableStreamUnderlyingSource,
+    ReadableStreamUpdateDataAvailableFromSource, UnwrapReadableStream,
+};
+use js::jsval::{JSVal, UndefinedValue};
+use js::rust::{HandleValue as SafeHandleValue, IntoHandle};
+
 use crate::dom::bindings::conversions::{ConversionBehavior, ConversionResult};
 use crate::dom::bindings::error::Error;
 use crate::dom::bindings::reflector::{reflect_dom_object, DomObject, Reflector};
@@ -13,28 +35,6 @@ use crate::dom::promise::Promise;
 use crate::js::conversions::FromJSValConvertible;
 use crate::realms::{enter_realm, InRealm};
 use crate::script_runtime::JSContext as SafeJSContext;
-use dom_struct::dom_struct;
-use js::glue::{
-    CreateReadableStreamUnderlyingSource, DeleteReadableStreamUnderlyingSource,
-    ReadableStreamUnderlyingSourceTraps,
-};
-use js::jsapi::{HandleObject, HandleValue, Heap, JSContext, JSObject};
-use js::jsapi::{
-    IsReadableStream, NewReadableExternalSourceStreamObject, ReadableStreamClose,
-    ReadableStreamDefaultReaderRead, ReadableStreamError, ReadableStreamGetReader,
-    ReadableStreamIsDisturbed, ReadableStreamIsLocked, ReadableStreamIsReadable,
-    ReadableStreamReaderMode, ReadableStreamReaderReleaseLock, ReadableStreamUnderlyingSource,
-    ReadableStreamUpdateDataAvailableFromSource, UnwrapReadableStream,
-};
-use js::jsval::JSVal;
-use js::jsval::UndefinedValue;
-use js::rust::HandleValue as SafeHandleValue;
-use js::rust::IntoHandle;
-use std::cell::{Cell, RefCell};
-use std::os::raw::c_void;
-use std::ptr::{self, NonNull};
-use std::rc::Rc;
-use std::slice;
 
 static UNDERLYING_SOURCE_TRAPS: ReadableStreamUnderlyingSourceTraps =
     ReadableStreamUnderlyingSourceTraps {
@@ -119,7 +119,7 @@ impl ReadableStream {
     ) -> DomRoot<ReadableStream> {
         let _ar = enter_realm(global);
         let _ais = AutoIncumbentScript::new(global);
-        let cx = global.get_cx();
+        let cx = GlobalScope::get_cx();
 
         let source = Rc::new(ExternalUnderlyingSourceController::new(source));
 
@@ -156,7 +156,7 @@ impl ReadableStream {
     pub fn enqueue_native(&self, bytes: Vec<u8>) {
         let global = self.global();
         let _ar = enter_realm(&*global);
-        let cx = global.get_cx();
+        let cx = GlobalScope::get_cx();
 
         let handle = unsafe { self.js_stream.handle() };
 
@@ -170,7 +170,7 @@ impl ReadableStream {
     pub fn error_native(&self, error: Error) {
         let global = self.global();
         let _ar = enter_realm(&*global);
-        let cx = global.get_cx();
+        let cx = GlobalScope::get_cx();
 
         unsafe {
             rooted!(in(*cx) let mut js_error = UndefinedValue());
@@ -187,7 +187,7 @@ impl ReadableStream {
     pub fn close_native(&self) {
         let global = self.global();
         let _ar = enter_realm(&*global);
-        let cx = global.get_cx();
+        let cx = GlobalScope::get_cx();
 
         let handle = unsafe { self.js_stream.handle() };
 
@@ -222,7 +222,7 @@ impl ReadableStream {
 
         let global = self.global();
         let _ar = enter_realm(&*global);
-        let cx = global.get_cx();
+        let cx = GlobalScope::get_cx();
 
         unsafe {
             rooted!(in(*cx) let reader = ReadableStreamGetReader(
@@ -252,7 +252,7 @@ impl ReadableStream {
         let _ar = enter_realm(&*global);
         let _aes = AutoEntryScript::new(&*global);
 
-        let cx = global.get_cx();
+        let cx = GlobalScope::get_cx();
 
         unsafe {
             rooted!(in(*cx) let promise_obj = ReadableStreamDefaultReaderRead(
@@ -275,7 +275,7 @@ impl ReadableStream {
 
         let global = self.global();
         let _ar = enter_realm(&*global);
-        let cx = global.get_cx();
+        let cx = GlobalScope::get_cx();
 
         unsafe {
             ReadableStreamReaderReleaseLock(*cx, self.js_reader.handle());
@@ -292,7 +292,7 @@ impl ReadableStream {
         }
 
         // Otherwise, still double-check that script didn't lock the stream.
-        let cx = self.global().get_cx();
+        let cx = GlobalScope::get_cx();
         let mut locked_or_disturbed = false;
 
         unsafe {
@@ -305,7 +305,7 @@ impl ReadableStream {
     #[allow(unsafe_code)]
     pub fn is_disturbed(&self) -> bool {
         // Check that script didn't disturb the stream.
-        let cx = self.global().get_cx();
+        let cx = GlobalScope::get_cx();
         let mut locked_or_disturbed = false;
 
         unsafe {
@@ -332,11 +332,18 @@ unsafe extern "C" fn write_into_read_request_buffer(
     source: *const c_void,
     _cx: *mut JSContext,
     _stream: HandleObject,
-    buffer: *mut c_void,
+    chunk: HandleObject,
     length: usize,
     bytes_written: *mut usize,
 ) {
     let source = &*(source as *const ExternalUnderlyingSourceController);
+    let mut is_shared_memory = false;
+    let buffer = JS_GetArrayBufferViewData(
+        *chunk,
+        &mut is_shared_memory,
+        &AutoRequireNoGC { _address: 0 },
+    );
+    assert!(!is_shared_memory);
     let slice = slice::from_raw_parts_mut(buffer as *mut u8, length);
     source.write_into_buffer(slice);
 

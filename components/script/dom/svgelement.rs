@@ -2,18 +2,19 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+use dom_struct::dom_struct;
+use html5ever::{namespace_url, ns, LocalName, Prefix};
+use js::rust::HandleObject;
+use style_traits::dom::ElementState;
+
 use crate::dom::bindings::codegen::Bindings::SVGElementBinding::SVGElementMethods;
 use crate::dom::bindings::inheritance::Castable;
 use crate::dom::bindings::root::{Dom, DomRoot, MutNullableDom};
 use crate::dom::cssstyledeclaration::{CSSModificationAccess, CSSStyleDeclaration, CSSStyleOwner};
 use crate::dom::document::Document;
 use crate::dom::element::Element;
-use crate::dom::node::window_from_node;
-use crate::dom::node::Node;
+use crate::dom::node::{window_from_node, Node};
 use crate::dom::virtualmethods::VirtualMethods;
-use dom_struct::dom_struct;
-use html5ever::{LocalName, Prefix};
-use style::element_state::ElementState;
 
 #[dom_struct]
 pub struct SVGElement {
@@ -46,10 +47,12 @@ impl SVGElement {
         tag_name: LocalName,
         prefix: Option<Prefix>,
         document: &Document,
+        proto: Option<HandleObject>,
     ) -> DomRoot<SVGElement> {
-        Node::reflect_node(
+        Node::reflect_node_with_proto(
             Box::new(SVGElement::new_inherited(tag_name, prefix, document)),
             document,
+            proto,
         )
     }
 }

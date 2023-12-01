@@ -2,8 +2,10 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-use crate::canvas_paint_thread::{AntialiasMode, ImageUpdate, WebrenderApi};
-use crate::raqote_backend::Repetition;
+use std::cell::RefCell;
+use std::mem;
+use std::sync::{Arc, Mutex};
+
 use canvas_traits::canvas::*;
 use cssparser::RGBA;
 use euclid::default::{Point2D, Rect, Size2D, Transform2D, Vector2D};
@@ -17,17 +19,17 @@ use gfx::font::FontHandleMethods;
 use gfx::font_cache_thread::FontCacheThread;
 use gfx::font_context::FontContext;
 use ipc_channel::ipc::{IpcSender, IpcSharedMemory};
+use log::{debug, error, warn};
 use num_traits::ToPrimitive;
 use servo_arc::Arc as ServoArc;
-use std::cell::RefCell;
-#[allow(unused_imports)]
-use std::marker::PhantomData;
-use std::mem;
-use std::sync::{Arc, Mutex};
 use style::properties::style_structs::Font as FontStyleStruct;
 use style::values::computed::font;
 use style_traits::values::ToCss;
-use webrender_api::units::RectExt as RectExt_;
+use webrender_api::units::{DeviceIntSize, RectExt as RectExt_};
+use webrender_api::{ImageData, ImageDescriptor, ImageDescriptorFlags, ImageFormat, ImageKey};
+
+use crate::canvas_paint_thread::{AntialiasMode, ImageUpdate, WebrenderApi};
+use crate::raqote_backend::Repetition;
 
 /// The canvas data stores a state machine for the current status of
 /// the path data and any relevant transformations that are
@@ -243,23 +245,10 @@ pub trait GenericDrawTarget {
         source: Rect<i32>,
         destination: Point2D<i32>,
     );
-    fn create_gradient_stops(
-        &self,
-        gradient_stops: Vec<GradientStop>,
-        extend_mode: ExtendMode,
-    ) -> GradientStops;
+    fn create_gradient_stops(&self, gradient_stops: Vec<GradientStop>) -> GradientStops;
     fn create_path_builder(&self) -> Box<dyn GenericPathBuilder>;
-    fn create_similar_draw_target(
-        &self,
-        size: &Size2D<i32>,
-        format: SurfaceFormat,
-    ) -> Box<dyn GenericDrawTarget>;
-    fn create_source_surface_from_data(
-        &self,
-        data: &[u8],
-        size: Size2D<i32>,
-        stride: i32,
-    ) -> Option<SourceSurface>;
+    fn create_similar_draw_target(&self, size: &Size2D<i32>) -> Box<dyn GenericDrawTarget>;
+    fn create_source_surface_from_data(&self, data: &[u8]) -> Option<SourceSurface>;
     fn draw_surface(
         &mut self,
         surface: SourceSurface,
@@ -288,7 +277,6 @@ pub trait GenericDrawTarget {
         draw_options: &DrawOptions,
     );
     fn fill_rect(&mut self, rect: &Rect<f32>, pattern: Pattern, draw_options: Option<&DrawOptions>);
-    fn get_format(&self) -> SurfaceFormat;
     fn get_size(&self) -> Size2D<i32>;
     fn get_transform(&self) -> Transform2D<f32>;
     fn pop_clip(&mut self);
@@ -321,11 +309,6 @@ pub trait GenericDrawTarget {
     fn snapshot_data_owned(&self) -> Vec<u8>;
 }
 
-#[derive(Clone)]
-pub enum ExtendMode {
-    Raqote(()),
-}
-
 pub enum GradientStop {
     Raqote(raqote::GradientStop),
 }
@@ -344,10 +327,6 @@ pub enum CompositionOp {
     Raqote(raqote::BlendMode),
 }
 
-pub enum SurfaceFormat {
-    Raqote(()),
-}
-
 #[derive(Clone)]
 pub enum SourceSurface {
     Raqote(Vec<u8>), // TODO: See if we can avoid the alloc (probably?)
@@ -363,24 +342,20 @@ pub enum Pattern<'a> {
     Raqote(crate::raqote_backend::Pattern<'a>),
 }
 
-pub enum DrawSurfaceOptions {
-    Raqote(()),
-}
-
 #[derive(Clone)]
 pub enum DrawOptions {
     Raqote(raqote::DrawOptions),
 }
 
 #[derive(Clone)]
-pub enum StrokeOptions<'a> {
-    Raqote(raqote::StrokeStyle, PhantomData<&'a ()>),
+pub enum StrokeOptions {
+    Raqote(raqote::StrokeStyle),
 }
 
 #[derive(Clone, Copy)]
 pub enum Filter {
-    Linear,
-    Point,
+    Bilinear,
+    Nearest,
 }
 
 pub(crate) type CanvasFontContext = FontContext<FontCacheThread>;
@@ -405,11 +380,11 @@ pub struct CanvasData<'a> {
     state: CanvasPaintState<'a>,
     saved_states: Vec<CanvasPaintState<'a>>,
     webrender_api: Box<dyn WebrenderApi>,
-    image_key: Option<webrender_api::ImageKey>,
+    image_key: Option<ImageKey>,
     /// An old webrender image key that can be deleted when the next epoch ends.
-    old_image_key: Option<webrender_api::ImageKey>,
+    old_image_key: Option<ImageKey>,
     /// An old webrender image key that can be deleted when the current epoch ends.
-    very_old_image_key: Option<webrender_api::ImageKey>,
+    very_old_image_key: Option<ImageKey>,
     font_cache_thread: Mutex<FontCacheThread>,
 }
 
@@ -442,11 +417,12 @@ impl<'a> CanvasData<'a> {
 
     pub fn draw_image(
         &mut self,
-        image_data: Vec<u8>,
+        image_data: &[u8],
         image_size: Size2D<f64>,
         dest_rect: Rect<f64>,
         source_rect: Rect<f64>,
         smoothing_enabled: bool,
+        premultiply: bool,
     ) {
         // We round up the floating pixel values to draw the pixels
         let source_rect = source_rect.ceil();
@@ -465,6 +441,7 @@ impl<'a> CanvasData<'a> {
                 source_rect.size,
                 dest_rect,
                 smoothing_enabled,
+                premultiply,
                 &draw_options,
             );
         };
@@ -511,7 +488,7 @@ impl<'a> CanvasData<'a> {
             .state
             .font_style
             .as_ref()
-            .map_or(10., |style| style.font_size.size().px());
+            .map_or(10., |style| style.font_size.computed_size().px());
         let font_style = self.state.font_style.as_ref();
         let font = font_style.map_or_else(
             || load_system_font_from_style(None),
@@ -1107,15 +1084,15 @@ impl<'a> CanvasData<'a> {
     pub fn send_data(&mut self, chan: IpcSender<CanvasImageData>) {
         let size = self.drawtarget.get_size();
 
-        let descriptor = webrender_api::ImageDescriptor {
-            size: webrender_api::units::DeviceIntSize::new(size.width, size.height),
+        let descriptor = ImageDescriptor {
+            size: DeviceIntSize::new(size.width, size.height),
             stride: None,
-            format: webrender_api::ImageFormat::BGRA8,
+            format: ImageFormat::BGRA8,
             offset: 0,
-            flags: webrender_api::ImageDescriptorFlags::empty(),
+            flags: ImageDescriptorFlags::empty(),
         };
         let data = self.drawtarget.snapshot_data_owned();
-        let data = webrender_api::ImageData::Raw(Arc::new(data));
+        let data = ImageData::Raw(Arc::new(data));
 
         let mut updates = vec![];
 
@@ -1156,11 +1133,7 @@ impl<'a> CanvasData<'a> {
         pixels::rgba8_byte_swap_and_premultiply_inplace(&mut imagedata);
         let source_surface = self
             .drawtarget
-            .create_source_surface_from_data(
-                &imagedata,
-                rect.size.to_i32(),
-                rect.size.width as i32 * 4,
-            )
+            .create_source_surface_from_data(&imagedata)
             .unwrap();
         self.drawtarget.copy_surface(
             source_surface,
@@ -1206,16 +1179,13 @@ impl<'a> CanvasData<'a> {
     }
 
     fn create_draw_target_for_shadow(&self, source_rect: &Rect<f32>) -> Box<dyn GenericDrawTarget> {
-        let mut draw_target = self.drawtarget.create_similar_draw_target(
-            &Size2D::new(
-                source_rect.size.width as i32,
-                source_rect.size.height as i32,
-            ),
-            self.drawtarget.get_format(),
+        let mut draw_target = self.drawtarget.create_similar_draw_target(&Size2D::new(
+            source_rect.size.width as i32,
+            source_rect.size.height as i32,
+        ));
+        let matrix = self.state.transform.then(
+            &Transform2D::identity().pre_translate(-source_rect.origin.to_vector().cast::<f32>()),
         );
-        let matrix = Transform2D::identity()
-            .pre_translate(-source_rect.origin.to_vector().cast::<f32>())
-            .pre_transform(&self.state.transform);
         draw_target.set_transform(&matrix);
         draw_target
     }
@@ -1224,7 +1194,7 @@ impl<'a> CanvasData<'a> {
     where
         F: FnOnce(&mut dyn GenericDrawTarget),
     {
-        let shadow_src_rect = self.state.transform.transform_rect(rect);
+        let shadow_src_rect = self.state.transform.outer_transformed_rect(rect);
         let mut new_draw_target = self.create_draw_target_for_shadow(&shadow_src_rect);
         draw_shadow_source(&mut *new_draw_target);
         self.drawtarget.draw_surface_with_shadow(
@@ -1284,7 +1254,7 @@ pub struct CanvasPaintState<'a> {
     pub draw_options: DrawOptions,
     pub fill_style: Pattern<'a>,
     pub stroke_style: Pattern<'a>,
-    pub stroke_opts: StrokeOptions<'a>,
+    pub stroke_opts: StrokeOptions,
     /// The current 2D transform matrix.
     pub transform: Transform2D<f32>,
     pub shadow_offset_x: f64,
@@ -1302,17 +1272,24 @@ pub struct CanvasPaintState<'a> {
 /// image_size: The size of the image to be written
 /// dest_rect: Area of the destination target where the pixels will be copied
 /// smoothing_enabled: It determines if smoothing is applied to the image result
+/// premultiply: Determines whenever the image data should be premultiplied or not
 fn write_image(
     draw_target: &mut dyn GenericDrawTarget,
-    image_data: Vec<u8>,
+    mut image_data: Vec<u8>,
     image_size: Size2D<f64>,
     dest_rect: Rect<f64>,
     smoothing_enabled: bool,
+    premultiply: bool,
     draw_options: &DrawOptions,
 ) {
     if image_data.is_empty() {
         return;
     }
+
+    if premultiply {
+        pixels::rgba8_premultiply_inplace(&mut image_data);
+    }
+
     let image_rect = Rect::new(Point2D::zero(), image_size);
 
     // From spec https://html.spec.whatwg.org/multipage/#dom-context-2d-drawimage
@@ -1320,14 +1297,13 @@ fn write_image(
     // to apply a smoothing algorithm to the image data when it is scaled.
     // Otherwise, the image must be rendered using nearest-neighbor interpolation.
     let filter = if smoothing_enabled {
-        Filter::Linear
+        Filter::Bilinear
     } else {
-        Filter::Point
+        Filter::Nearest
     };
-    let image_size = image_size.to_i32();
 
     let source_surface = draw_target
-        .create_source_surface_from_data(&image_data, image_size, image_size.width * 4)
+        .create_source_surface_from_data(&image_data)
         .unwrap();
 
     draw_target.draw_surface(source_surface, dest_rect, image_rect, filter, draw_options);
@@ -1387,6 +1363,8 @@ fn to_font_kit_family(font_family: &font::SingleFontFamily) -> FamilyName {
             font::GenericFontFamily::Monospace => FamilyName::Monospace,
             font::GenericFontFamily::Fantasy => FamilyName::Fantasy,
             font::GenericFontFamily::Cursive => FamilyName::Cursive,
+            // TODO: There is no FontFamily::SystemUi.
+            font::GenericFontFamily::SystemUi => unreachable!("system-ui should be disabled"),
             font::GenericFontFamily::None => unreachable!("Shouldn't appear in computed values"),
         },
     }
@@ -1406,15 +1384,15 @@ fn load_system_font_from_style(font_style: Option<&FontStyleStruct>) -> Option<F
         .collect::<Vec<_>>();
     let properties = properties
         .style(match style.font_style {
-            font::FontStyle::Normal => Style::Normal,
-            font::FontStyle::Italic => Style::Italic,
-            font::FontStyle::Oblique(..) => {
+            font::FontStyle::NORMAL => Style::Normal,
+            font::FontStyle::ITALIC => Style::Italic,
+            _ => {
                 // TODO: support oblique angle.
                 Style::Oblique
             },
         })
-        .weight(Weight(style.font_weight.0))
-        .stretch(Stretch(style.font_stretch.value()));
+        .weight(Weight(style.font_weight.value()))
+        .stretch(Stretch(style.font_stretch.to_percentage().0));
     let font_handle = match SystemSource::new().select_best_match(&family_names, &properties) {
         Ok(handle) => handle,
         Err(e) => {

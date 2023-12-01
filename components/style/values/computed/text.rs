@@ -11,6 +11,7 @@ use crate::values::computed::{Context, NonNegativeLength, NonNegativeNumber, ToC
 use crate::values::generics::text::InitialLetter as GenericInitialLetter;
 use crate::values::generics::text::LineHeight as GenericLineHeight;
 use crate::values::generics::text::{GenericTextDecorationLength, Spacing};
+use crate::values::resolved::{Context as ResolvedContext, ToResolvedValue};
 use crate::values::specified::text::{self as specified, TextOverflowSide};
 use crate::values::specified::text::{TextEmphasisFillMode, TextEmphasisShapeKeyword};
 use crate::values::{CSSFloat, CSSInteger};
@@ -18,10 +19,13 @@ use crate::Zero;
 use std::fmt::{self, Write};
 use style_traits::{CssWriter, ToCss};
 
-pub use crate::values::specified::text::{TextAlignLast, TextUnderlinePosition};
-pub use crate::values::specified::{LineBreak, OverflowWrap, WordBreak};
+pub use crate::values::specified::text::{
+    MozControlCharacterVisibility, TextAlignLast, TextUnderlinePosition,
+};
+pub use crate::values::specified::HyphenateCharacter;
+pub use crate::values::specified::{LineBreak, OverflowWrap, RubyPosition, WordBreak};
 pub use crate::values::specified::{TextDecorationLine, TextEmphasisPosition};
-pub use crate::values::specified::{TextDecorationSkipInk, TextTransform};
+pub use crate::values::specified::{TextDecorationSkipInk, TextJustify, TextTransform};
 
 /// A computed value for the `initial-letter` property.
 pub type InitialLetter = GenericInitialLetter<CSSFloat, CSSInteger>;
@@ -110,6 +114,46 @@ impl ToComputedValue for specified::WordSpacing {
 /// A computed value for the `line-height` property.
 pub type LineHeight = GenericLineHeight<NonNegativeNumber, NonNegativeLength>;
 
+impl ToResolvedValue for LineHeight {
+    type ResolvedValue = Self;
+
+    fn to_resolved_value(self, context: &ResolvedContext) -> Self::ResolvedValue {
+        // Resolve <number> to an absolute <length> based on font size.
+        #[cfg(feature = "gecko")] {
+            if matches!(self, Self::Normal | Self::MozBlockHeight) {
+                return self;
+            }
+            let wm = context.style.writing_mode;
+            let vertical = wm.is_vertical() && !wm.is_sideways();
+            return Self::Length(context.device.calc_line_height(
+                &self,
+                vertical,
+                context.style.get_font(),
+                Some(context.element_info.element),
+            ));
+        }
+        if let LineHeight::Number(num) = &self {
+            let size = context.style.get_font().clone_font_size().computed_size();
+            LineHeight::Length(NonNegativeLength::new(size.px() * num.0))
+        } else {
+            self
+        }
+    }
+
+    #[inline]
+    fn from_resolved_value(value: Self::ResolvedValue) -> Self {
+        value
+    }
+}
+
+impl WordSpacing {
+    /// Return the `normal` computed value, which is just zero.
+    #[inline]
+    pub fn normal() -> Self {
+        LengthPercentage::zero()
+    }
+}
+
 #[derive(Clone, Debug, MallocSizeOf, PartialEq, ToResolvedValue)]
 #[repr(C)]
 /// text-overflow.
@@ -150,7 +194,7 @@ impl ToCss for TextOverflow {
             self.second.to_css(dest)?;
         } else {
             self.first.to_css(dest)?;
-            dest.write_str(" ")?;
+            dest.write_char(' ')?;
             self.second.to_css(dest)?;
         }
         Ok(())

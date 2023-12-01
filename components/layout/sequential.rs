@@ -4,6 +4,13 @@
 
 //! Implements sequential traversals over the DOM and flow trees.
 
+use app_units::Au;
+use euclid::default::{Point2D, Rect, Size2D, Vector2D};
+use servo_config::opts;
+use style::servo::restyle_damage::ServoRestyleDamage;
+use webrender_api::units::LayoutPoint;
+use webrender_api::{ColorF, PropertyBinding, RectangleDisplayItem};
+
 use crate::context::LayoutContext;
 use crate::display_list::conversions::ToLayout;
 use crate::display_list::items::{self, CommonDisplayItem, DisplayItem, DisplayListSection};
@@ -13,14 +20,10 @@ use crate::flow::{Flow, FlowFlags, GetBaseFlow, ImmutableFlowUtils};
 use crate::fragment::{CoordinateSystem, FragmentBorderBoxIterator};
 use crate::generated_content::ResolveGeneratedContent;
 use crate::incremental::RelayoutMode;
-use crate::traversal::{AssignBSizes, AssignISizes, BubbleISizes, BuildDisplayList};
-use crate::traversal::{InorderFlowTraversal, PostorderFlowTraversal, PreorderFlowTraversal};
-use app_units::Au;
-use euclid::default::{Point2D, Rect, Size2D, Vector2D};
-use servo_config::opts;
-use style::servo::restyle_damage::ServoRestyleDamage;
-use webrender_api::units::LayoutPoint;
-use webrender_api::PropertyBinding;
+use crate::traversal::{
+    AssignBSizes, AssignISizes, BubbleISizes, BuildDisplayList, InorderFlowTraversal,
+    PostorderFlowTraversal, PreorderFlowTraversal,
+};
 
 pub fn resolve_generated_content(root: &mut dyn Flow, layout_context: &LayoutContext) {
     ResolveGeneratedContent::new(&layout_context).traverse(root, 0);
@@ -55,7 +58,7 @@ pub fn reflow(root: &mut dyn Flow, layout_context: &LayoutContext, relayout_mode
         }
     }
 
-    if opts::get().bubble_inline_sizes_separately {
+    if opts::get().debug.bubble_inline_sizes_separately {
         let bubble_inline_sizes = BubbleISizes {
             layout_context: &layout_context,
         };
@@ -75,7 +78,7 @@ pub fn reflow(root: &mut dyn Flow, layout_context: &LayoutContext, relayout_mode
 pub fn build_display_list_for_subtree<'a>(
     flow_root: &mut dyn Flow,
     layout_context: &'a LayoutContext,
-    background_color: webrender_api::ColorF,
+    background_color: ColorF,
     client_size: Size2D<Au>,
 ) -> DisplayListBuildState<'a> {
     let mut state = StackingContextCollectionState::new(layout_context.id);
@@ -94,7 +97,7 @@ pub fn build_display_list_for_subtree<'a>(
     );
     state.add_display_item(DisplayItem::Rectangle(CommonDisplayItem::new(
         base,
-        webrender_api::RectangleDisplayItem {
+        RectangleDisplayItem {
             color: PropertyBinding::Value(background_color),
             common: items::empty_common_item_properties(),
             bounds: bounds.to_layout(),
@@ -183,7 +186,7 @@ pub fn guess_float_placement(flow: &mut dyn Flow) {
             .flags
             .contains(FlowFlags::IS_ABSOLUTELY_POSITIONED)
         {
-            // Do not propagate floats in or out, but do propogate between kids.
+            // Do not propagate floats in or out, but do propagate between kids.
             guess_float_placement(kid);
         } else {
             floats_in.compute_floats_in(kid);

@@ -2,12 +2,17 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+use std::ptr::NonNull;
+
+use dom_struct::dom_struct;
+use euclid::{RigidTransform3D, Rotation3D, Vector3D};
+use js::jsapi::{Heap, JSObject};
+use js::rust::HandleObject;
+
 use crate::dom::bindings::codegen::Bindings::DOMPointBinding::DOMPointInit;
 use crate::dom::bindings::codegen::Bindings::XRRigidTransformBinding::XRRigidTransformMethods;
-use crate::dom::bindings::error::Error;
-use crate::dom::bindings::error::Fallible;
-use crate::dom::bindings::reflector::DomObject;
-use crate::dom::bindings::reflector::{reflect_dom_object, Reflector};
+use crate::dom::bindings::error::{Error, Fallible};
+use crate::dom::bindings::reflector::{reflect_dom_object_with_proto, DomObject, Reflector};
 use crate::dom::bindings::root::{DomRoot, MutNullableDom};
 use crate::dom::bindings::utils::create_typed_array;
 use crate::dom::dompointreadonly::DOMPointReadOnly;
@@ -15,10 +20,6 @@ use crate::dom::globalscope::GlobalScope;
 use crate::dom::window::Window;
 use crate::dom::xrsession::ApiRigidTransform;
 use crate::script_runtime::JSContext;
-use dom_struct::dom_struct;
-use euclid::{RigidTransform3D, Rotation3D, Vector3D};
-use js::jsapi::{Heap, JSObject};
-use std::ptr::NonNull;
 
 #[dom_struct]
 pub struct XRRigidTransform {
@@ -26,6 +27,7 @@ pub struct XRRigidTransform {
     position: MutNullableDom<DOMPointReadOnly>,
     orientation: MutNullableDom<DOMPointReadOnly>,
     #[ignore_malloc_size_of = "defined in euclid"]
+    #[no_trace]
     transform: ApiRigidTransform,
     inverse: MutNullableDom<XRRigidTransform>,
     #[ignore_malloc_size_of = "defined in mozjs"]
@@ -45,7 +47,19 @@ impl XRRigidTransform {
     }
 
     pub fn new(global: &GlobalScope, transform: ApiRigidTransform) -> DomRoot<XRRigidTransform> {
-        reflect_dom_object(Box::new(XRRigidTransform::new_inherited(transform)), global)
+        Self::new_with_proto(global, None, transform)
+    }
+
+    fn new_with_proto(
+        global: &GlobalScope,
+        proto: Option<HandleObject>,
+        transform: ApiRigidTransform,
+    ) -> DomRoot<XRRigidTransform> {
+        reflect_dom_object_with_proto(
+            Box::new(XRRigidTransform::new_inherited(transform)),
+            global,
+            proto,
+        )
     }
 
     pub fn identity(window: &GlobalScope) -> DomRoot<XRRigidTransform> {
@@ -57,6 +71,7 @@ impl XRRigidTransform {
     #[allow(non_snake_case)]
     pub fn Constructor(
         window: &Window,
+        proto: Option<HandleObject>,
         position: &DOMPointInit,
         orientation: &DOMPointInit,
     ) -> Fallible<DomRoot<Self>> {
@@ -81,7 +96,11 @@ impl XRRigidTransform {
             return Err(Error::InvalidState);
         }
         let transform = RigidTransform3D::new(rotate, translate);
-        Ok(XRRigidTransform::new(&window.global(), transform))
+        Ok(XRRigidTransform::new_with_proto(
+            &window.global(),
+            proto,
+            transform,
+        ))
     }
 }
 
@@ -117,10 +136,10 @@ impl XRRigidTransformMethods for XRRigidTransform {
     // https://immersive-web.github.io/webxr/#dom-xrrigidtransform-matrix
     fn Matrix(&self, _cx: JSContext) -> NonNull<JSObject> {
         if self.matrix.get().is_null() {
-            let cx = self.global().get_cx();
+            let cx = GlobalScope::get_cx();
             // According to the spec all matrices are column-major,
-            // however euclid uses row vectors so we use .to_row_major_array()
-            let arr = self.transform.to_transform().to_row_major_array();
+            // however euclid uses row vectors so we use .to_array()
+            let arr = self.transform.to_transform().to_array();
             create_typed_array(cx, &arr, &self.matrix);
         }
         NonNull::new(self.matrix.get()).unwrap()

@@ -46,57 +46,24 @@
 //!   Note: WebRender has a reduced fork of this crate, so that we can avoid
 //!   publishing this crate on crates.io.
 
-#[cfg(feature = "servo")]
-extern crate accountable_refcell;
-extern crate app_units;
-#[cfg(feature = "servo")]
-extern crate content_security_policy;
-#[cfg(feature = "servo")]
-extern crate crossbeam_channel;
-extern crate cssparser;
-extern crate euclid;
-extern crate hashglobe;
-#[cfg(feature = "servo")]
-extern crate http;
-#[cfg(feature = "servo")]
-extern crate hyper_serde;
-#[cfg(feature = "servo")]
-extern crate keyboard_types;
-extern crate selectors;
-#[cfg(feature = "servo")]
-extern crate serde;
-#[cfg(feature = "servo")]
-extern crate serde_bytes;
-extern crate servo_arc;
-extern crate smallbitvec;
-extern crate smallvec;
-#[cfg(feature = "servo")]
-extern crate string_cache;
-extern crate thin_slice;
-#[cfg(feature = "servo")]
-extern crate time;
-#[cfg(feature = "url")]
-extern crate url;
-#[cfg(feature = "servo")]
-extern crate uuid;
-extern crate void;
-#[cfg(feature = "webrender_api")]
-extern crate webrender_api;
-#[cfg(feature = "servo")]
-extern crate xml5ever;
+use std::hash::{BuildHasher, Hash};
+use std::mem::size_of;
+use std::ops::{Deref, DerefMut, Range};
+use std::os::raw::c_void;
 
 #[cfg(feature = "servo")]
 use content_security_policy as csp;
 #[cfg(feature = "servo")]
 use serde_bytes::ByteBuf;
-use std::hash::{BuildHasher, Hash};
-use std::mem::size_of;
-use std::ops::Range;
-use std::ops::{Deref, DerefMut};
-use std::os::raw::c_void;
 #[cfg(feature = "servo")]
 use uuid::Uuid;
 use void::Void;
+use webrender_api::{
+    BorderRadius, BorderStyle, BoxShadowClipMode, ColorF, ComplexClipRegion, ExtendMode,
+    ExternalScrollId, FilterOp, FontInstanceKey, GlyphInstance, GradientStop, ImageKey,
+    ImageRendering, LineStyle, MixBlendMode, NinePatchBorder, NormalBorder, RepeatMode,
+    StickyOffsetBounds, TransformStyle,
+};
 
 /// A C function that takes a pointer to a heap allocation and returns its size.
 type VoidPtrToSizeFn = unsafe extern "C" fn(ptr: *const c_void) -> usize;
@@ -247,24 +214,6 @@ impl<T: ?Sized> MallocShallowSizeOf for Box<T> {
 }
 
 impl<T: MallocSizeOf + ?Sized> MallocSizeOf for Box<T> {
-    fn size_of(&self, ops: &mut MallocSizeOfOps) -> usize {
-        self.shallow_size_of(ops) + (**self).size_of(ops)
-    }
-}
-
-impl<T> MallocShallowSizeOf for thin_slice::ThinBoxedSlice<T> {
-    fn shallow_size_of(&self, ops: &mut MallocSizeOfOps) -> usize {
-        let mut n = 0;
-        unsafe {
-            n += thin_slice::ThinBoxedSlice::spilled_storage(self)
-                .map_or(0, |ptr| ops.malloc_size_of(ptr));
-            n += ops.malloc_size_of(&**self);
-        }
-        n
-    }
-}
-
-impl<T: MallocSizeOf> MallocSizeOf for thin_slice::ThinBoxedSlice<T> {
     fn size_of(&self, ops: &mut MallocSizeOfOps) -> usize {
         self.shallow_size_of(ops) + (**self).size_of(ops)
     }
@@ -447,6 +396,31 @@ where
     }
 }
 
+impl<T> MallocShallowSizeOf for thin_vec::ThinVec<T> {
+    fn shallow_size_of(&self, ops: &mut MallocSizeOfOps) -> usize {
+        if self.capacity() == 0 {
+            // If it's the singleton we might not be a heap pointer.
+            return 0;
+        }
+
+        assert_eq!(
+            std::mem::size_of::<Self>(),
+            std::mem::size_of::<*const ()>()
+        );
+        unsafe { ops.malloc_size_of(*(self as *const Self as *const *const ())) }
+    }
+}
+
+impl<T: MallocSizeOf> MallocSizeOf for thin_vec::ThinVec<T> {
+    fn size_of(&self, ops: &mut MallocSizeOfOps) -> usize {
+        let mut n = self.shallow_size_of(ops);
+        for elem in self.iter() {
+            n += elem.size_of(ops);
+        }
+        n
+    }
+}
+
 macro_rules! malloc_size_of_hash_set {
     ($ty:ty) => {
         impl<T, S> MallocShallowSizeOf for $ty
@@ -487,8 +461,7 @@ macro_rules! malloc_size_of_hash_set {
 }
 
 malloc_size_of_hash_set!(std::collections::HashSet<T, S>);
-malloc_size_of_hash_set!(hashglobe::hash_set::HashSet<T, S>);
-malloc_size_of_hash_set!(hashglobe::fake::HashSet<T, S>);
+malloc_size_of_hash_set!(indexmap::IndexSet<T, S>);
 
 macro_rules! malloc_size_of_hash_map {
     ($ty:ty) => {
@@ -528,8 +501,7 @@ macro_rules! malloc_size_of_hash_map {
 }
 
 malloc_size_of_hash_map!(std::collections::HashMap<K, V, S>);
-malloc_size_of_hash_map!(hashglobe::hash_map::HashMap<K, V, S>);
-malloc_size_of_hash_map!(hashglobe::fake::HashMap<K, V, S>);
+malloc_size_of_hash_map!(indexmap::IndexMap<K, V, S>);
 
 impl<K, V> MallocShallowSizeOf for std::collections::BTreeMap<K, V>
 where
@@ -749,6 +721,8 @@ where
                 selector.size_of(ops)
             },
             Component::Is(ref list) | Component::Where(ref list) => list.size_of(ops),
+            Component::Has(ref relative_selectors) => relative_selectors.size_of(ops),
+            Component::NthOf(ref nth_of_data) => nth_of_data.size_of(ops),
             Component::PseudoElement(ref pseudo) => (*pseudo).size_of(ops),
             Component::Combinator(..) |
             Component::ExplicitAnyNamespace |
@@ -762,20 +736,13 @@ where
             Component::Class(..) |
             Component::AttributeInNoNamespaceExists { .. } |
             Component::AttributeInNoNamespace { .. } |
-            Component::FirstChild |
-            Component::LastChild |
-            Component::OnlyChild |
             Component::Root |
             Component::Empty |
             Component::Scope |
-            Component::NthChild(..) |
-            Component::NthLastChild(..) |
-            Component::NthOfType(..) |
-            Component::NthLastOfType(..) |
-            Component::FirstOfType |
-            Component::LastOfType |
-            Component::OnlyOfType |
-            Component::Host(None) => 0,
+            Component::ParentSelector |
+            Component::Nth(..) |
+            Component::Host(None) |
+            Component::RelativeSelectorAnchor => 0,
         }
     }
 }
@@ -861,47 +828,45 @@ impl MallocSizeOf for url::Host {
     }
 }
 #[cfg(feature = "webrender_api")]
-malloc_size_of_is_0!(webrender_api::BorderRadius);
+malloc_size_of_is_0!(BorderRadius);
 #[cfg(feature = "webrender_api")]
-malloc_size_of_is_0!(webrender_api::BorderStyle);
+malloc_size_of_is_0!(BorderStyle);
 #[cfg(feature = "webrender_api")]
-malloc_size_of_is_0!(webrender_api::BoxShadowClipMode);
+malloc_size_of_is_0!(BoxShadowClipMode);
 #[cfg(feature = "webrender_api")]
-malloc_size_of_is_0!(webrender_api::ColorF);
+malloc_size_of_is_0!(ColorF);
 #[cfg(feature = "webrender_api")]
-malloc_size_of_is_0!(webrender_api::ComplexClipRegion);
+malloc_size_of_is_0!(ComplexClipRegion);
 #[cfg(feature = "webrender_api")]
-malloc_size_of_is_0!(webrender_api::ExtendMode);
+malloc_size_of_is_0!(ExtendMode);
 #[cfg(feature = "webrender_api")]
-malloc_size_of_is_0!(webrender_api::FilterOp);
+malloc_size_of_is_0!(FilterOp);
 #[cfg(feature = "webrender_api")]
-malloc_size_of_is_0!(webrender_api::ExternalScrollId);
+malloc_size_of_is_0!(ExternalScrollId);
 #[cfg(feature = "webrender_api")]
-malloc_size_of_is_0!(webrender_api::FontInstanceKey);
+malloc_size_of_is_0!(FontInstanceKey);
 #[cfg(feature = "webrender_api")]
-malloc_size_of_is_0!(webrender_api::GradientStop);
+malloc_size_of_is_0!(GradientStop);
 #[cfg(feature = "webrender_api")]
-malloc_size_of_is_0!(webrender_api::GlyphInstance);
+malloc_size_of_is_0!(GlyphInstance);
 #[cfg(feature = "webrender_api")]
-malloc_size_of_is_0!(webrender_api::NinePatchBorder);
+malloc_size_of_is_0!(NinePatchBorder);
 #[cfg(feature = "webrender_api")]
-malloc_size_of_is_0!(webrender_api::ImageKey);
+malloc_size_of_is_0!(ImageKey);
 #[cfg(feature = "webrender_api")]
-malloc_size_of_is_0!(webrender_api::ImageRendering);
+malloc_size_of_is_0!(ImageRendering);
 #[cfg(feature = "webrender_api")]
-malloc_size_of_is_0!(webrender_api::LineStyle);
+malloc_size_of_is_0!(LineStyle);
 #[cfg(feature = "webrender_api")]
-malloc_size_of_is_0!(webrender_api::MixBlendMode);
+malloc_size_of_is_0!(MixBlendMode);
 #[cfg(feature = "webrender_api")]
-malloc_size_of_is_0!(webrender_api::NormalBorder);
+malloc_size_of_is_0!(NormalBorder);
 #[cfg(feature = "webrender_api")]
-malloc_size_of_is_0!(webrender_api::RepeatMode);
+malloc_size_of_is_0!(RepeatMode);
 #[cfg(feature = "webrender_api")]
-malloc_size_of_is_0!(webrender_api::ScrollSensitivity);
+malloc_size_of_is_0!(StickyOffsetBounds);
 #[cfg(feature = "webrender_api")]
-malloc_size_of_is_0!(webrender_api::StickyOffsetBounds);
-#[cfg(feature = "webrender_api")]
-malloc_size_of_is_0!(webrender_api::TransformStyle);
+malloc_size_of_is_0!(TransformStyle);
 
 #[cfg(feature = "servo")]
 impl MallocSizeOf for keyboard_types::Key {

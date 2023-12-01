@@ -1,11 +1,29 @@
 # Hacking Servo - Quickstart
 
 This guide covers the basic things one needs to know to start hacking Servo.
-It doesn't cover how Servo works (see the [documentation](#documentation) section for that),
-but describes how to setup your environment to compile, run, and debug Servo. For information
-on the [Github Workflow](https://github.com/servo/servo/wiki/Github-workflow) and some helpful
-[Git Tips](https://github.com/servo/servo/wiki/Github-workflow#git-tips), see the
-[Wiki](https://github.com/servo/servo/wiki).
+It doesn't cover how Servo works or how to use Git effectively (see the
+[documentation](#documentation) section for those), but describes how to
+set up your environment to compile, run, and debug Servo.
+
+* [Building Servo](#building-servo)
+* [Running Servo](#running-servo)
+* [mach](#mach)
+    * [mach and Servo options](#mach-and-servo-options)
+* [Some basic Rust](#some-basic-rust)
+    * [Cargo and crates](#cargo-and-crates)
+    * [Working on a crate](#working-on-a-crate)
+* [Editor support](#editor-support)
+    * [Visual Studio Code](#visual-studio-code)
+* [Debugging](#debugging)
+    * [Logging](#logging)
+    * [println!()](#println)
+    * [Debugger](#debugger)
+* [Tests](#tests)
+    * [Updating a test](#updating-a-test)
+    * [Add a new test](#add-a-new-test)
+    * [Debugging a test](#debugging-a-test)
+* [Documentation](#documentation)
+* [Ask questions](#ask-questions)
 
 ## Building Servo
 
@@ -15,11 +33,19 @@ Building Servo is quite easy. Install the prerequisites described in the [README
 ./mach build -d
 ```
 
-*Note: on Mac, you might run into an SSL issue while compiling. You'll find a solution to this problem [here](https://github.com/sfackler/rust-openssl/issues/255).*
+There are three main build profiles, which you can build and use independently of one another:
 
-The `-d` option means "debug build". You can also build with the `-r` option which means "release build". Building with `-d` will allow you to use a debugger (lldb). A `-r` build is more performant. Release builds are slower to build.
+* debug builds, which allow you to use a debugger (lldb)
+* release builds, which are slower to build but more performant
+* production builds, which are used for official releases only
 
-You can use and build a release build and a debug build in parallel.
+| profile | mach option | optimised? | debug<br>info? | debug<br>assertions? | finds resources in<br>current working dir? |
+|---|---|---|---|---|---|
+| debug | `-d` | no | yes | yes | yes |
+| release | `-r` | yes | no | yes(!) | yes |
+| production | `--profile production` | yes | yes | no | no |
+
+You can change these settings in a servobuild file (see [servobuild.example](../servobuild.example)) or in the root [Cargo.toml](../Cargo.toml).
 
 ## Running Servo
 
@@ -37,7 +63,7 @@ The servo binary is located in `target/debug/servo` (or `target/release/servo`).
 
 If you build with `-d`, run with `-d`. If you build with `-r`, run with `-r`.
 
-## ./mach
+## mach
 
 `mach` is a python utility that does plenty of things to make our life easier (build, run, run tests, update dependencies… see `./mach --help`). Beside editing files and git commands, everything else is done via `mach`.
 
@@ -47,7 +73,7 @@ If you build with `-d`, run with `-d`. If you build with `-r`, run with `-r`.
 
 The `--`  separates `mach` options from `servo` options. This is not required, but we recommend it. `mach` and `servo` have some options with the same name (`--help`, `--debug`), so the `--` makes it clear where options apply.
 
-## Mach and Servo options
+### mach and Servo options
 
 This guide only covers the most important options. Be sure to look at all the available mach commands and the servo options:
 
@@ -73,7 +99,7 @@ For more exhaustive documentation:
 - [doc.rust-lang.org](https://doc.rust-lang.org)
 - [rust by example](https://doc.rust-lang.org/stable/rust-by-example)
 
-## Cargo and Crates
+### Cargo and crates
 
 A Rust library is called a crate. Servo uses plenty of crates. These crates are dependencies. They are listed in files called `Cargo.toml`. Servo is split into components and ports (see `components` and `ports` directories). Each has its own dependencies, and each has its own `Cargo.toml` file.
 
@@ -98,7 +124,7 @@ This file should not be edited by hand. In a normal Rust project, to update the 
 
 See [Cargo's documentation about Cargo.toml and Cargo.lock files](https://doc.rust-lang.org/cargo/guide/cargo-toml-vs-cargo-lock.html).
 
-## Working on a Crate
+### Working on a crate
 
 As explained above, Servo depends on a lot of libraries, which makes it very modular. While working on a bug in Servo, you'll often end up in one of its dependencies. You will then want to compile your own version of the dependency (and maybe compiling against the HEAD of the library will fix the issue!).
 
@@ -134,9 +160,78 @@ Both will tell any cargo project to not use the online version of the dependency
 
 For more details about overriding dependencies, see [Cargo's documentation](https://doc.crates.io/specifying-dependencies.html#overriding-dependencies).
 
+## Editor support
+
+### Visual Studio Code
+
+Running plain `cargo` will cause problems! For example, you might get rust-analyzer extension errors
+about build scripts like
+
+* The style crate requires enabling one of its 'servo' or 'gecko' feature flags and, in the 'servo'
+  case, one of 'servo-layout-2013' or 'servo-layout-2020'.
+
+* (if you are on NixOS) thread 'main' panicked at 'called \`Result::unwrap()\` on an \`Err\` value:
+  "Could not run \`PKG_CONFIG_ALLOW_SYSTEM_CFLAGS=\\"1\\" PKG_CONFIG_ALLOW_SYSTEM_LIBS=\\"1\\"
+  \\"pkg-config\\" \\"--libs\\" \\"--cflags\\" \\"fontconfig\\"\`
+
+This is because the rustflags (flags passed to the rust compiler) that standard `cargo` provides are
+different to what `./mach` uses, and so every time Servo is built using `cargo` it will undo all the
+work done by `./mach` (and vice versa).
+
+You can override this in a `.vscode/settings.json` file:
+
+```
+{
+    "rust-analyzer.check.overrideCommand": [
+        "./mach", "check", "--message-format=json" ],
+    "rust-analyzer.cargo.buildScripts.overrideCommand": [
+        "./mach", "check", "--message-format=json" ],
+    "rust-analyzer.rustfmt.overrideCommand": [ "./mach", "fmt" ],
+}
+```
+
+If that still causes problems, then supplying a different target directory should fix this (although it will increase
+the amount of disc space used).
+
+```
+{
+    "rust-analyzer.checkOnSave.overrideCommand": [
+        "./mach", "check", "--message-format=json", "--target-dir", "target/lsp" ],
+    "rust-analyzer.cargo.buildScripts.overrideCommand": [
+        "./mach", "check", "--message-format=json", "--target-dir", "target/lsp" ],
+    "rust-analyzer.rustfmt.overrideCommand": [ "./mach", "fmt" ],
+}
+```
+
+If you are on NixOS, these settings should be enough to not need to run `code .` from within a
+`nix-shell etc/shell.nix`, but it wouldn’t hurt to try that if you still have problems.
+
+When enabling rust-analyzer’s proc macro support, you may start to see errors like
+
+* proc macro \`MallocSizeOf\` not expanded: Cannot create expander for /path/to/servo/target/debug/deps/libfoo-0781e5a02b945749.so: unsupported ABI \`rustc 1.69.0-nightly (dc1d9d50f 2023-01-31)\` rust-analyzer(unresolved-proc-macro)
+
+This means rust-analyzer is using the wrong proc macro server, and you will need to configure the correct one manually. Use mach to query the current sysroot path, and copy the last line of output:
+
+```
+$ ./mach rustc --print sysroot
+NOTE: Entering nix-shell etc/shell.nix
+info: component 'llvm-tools' for target 'x86_64-unknown-linux-gnu' is up to date
+/home/me/.rustup/toolchains/nightly-2023-02-01-x86_64-unknown-linux-gnu
+```
+
+Then configure either your sysroot path or proc macro server path in `.vscode/settings.json`:
+
+```
+{
+    "rust-analyzer.procMacro.enable": true,
+    "rust-analyzer.cargo.sysroot": "[paste what you copied]",
+    "rust-analyzer.procMacro.server": "[paste what you copied]/libexec/rust-analyzer-proc-macro-srv",
+}
+```
+
 ## Debugging
 
-### Logging:
+### Logging
 
 Before starting the debugger right away, you might want to get some information about what's happening, how, and when. Luckily, Servo comes with plenty of logs that will help us. Type these 2 commands:
 
@@ -171,7 +266,7 @@ Using `RUST_LOG="debug"` is usually the very first thing you might want to do if
 RUST_LOG="debug" ./mach run -d -- -i -y 1 /tmp/a.html 2>&1 | ts -s "%.S: " | tee /tmp/log.txt
 ```
 
-You can filter by crate or module, for example `RUST_LOG="layout::inline=debug" ./mach run …`. Check the [env_logger](https://doc.rust-lang.org/log/env_logger/index.html) documentation for more details.
+You can filter by crate or module, for example `RUST_LOG="layout::inline=debug" ./mach run …`. Check the [env_logger](https://docs.rs/env_logger) documentation for more details.
 
 Use `RUST_BACKTRACE=1` to dump the backtrace when Servo panics.
 
@@ -256,7 +351,7 @@ To check code tidiness:
 ./mach test-tidy
 ```
 
-### Updating a test:
+### Updating a test
 
 In some cases, extensive tests for the feature you're working on already exist under tests/wpt:
 
@@ -269,7 +364,7 @@ it's likely that your feature had tests in wpt already.
 
 Include this commit in your pull request.
 
-### Add a new test:
+### Add a new test
 
 If you need to create a new test file, it should be located in `tests/wpt/mozilla/tests` or in `tests/wpt/web-platform-tests` if it's something that doesn't depend on servo-only features. You'll then need to update the list of tests and the list of expected results:
 
@@ -281,7 +376,7 @@ If you need to create a new test file, it should be located in `tests/wpt/mozill
 
 See the [debugging guide](./debugging.md) to get started in how to debug Servo.
 
-## Documentation:
+## Documentation
 
 - Servo's directory structure: [ORGANIZATION.md](./ORGANIZATION.md)
 - https://doc.servo.org/servo/index.html

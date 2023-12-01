@@ -25,38 +25,17 @@
 //!
 //!   http://dev.w3.org/csswg/css-sizing/
 
-use crate::context::LayoutContext;
-use crate::display_list::items::DisplayListSection;
-use crate::display_list::{
-    BorderPaintingMode, DisplayListBuildState, StackingContextCollectionFlags,
-    StackingContextCollectionState,
-};
-use crate::floats::{ClearType, FloatKind, Floats, PlacementInfo};
-use crate::flow::{
-    BaseFlow, EarlyAbsolutePositionInfo, Flow, FlowClass, ForceNonfloatedFlag, GetBaseFlow,
-};
-use crate::flow::{
-    FlowFlags, FragmentationContext, ImmutableFlowUtils, LateAbsolutePositionInfo, OpaqueFlow,
-};
-use crate::flow_list::FlowList;
-use crate::fragment::{
-    CoordinateSystem, Fragment, FragmentBorderBoxIterator, FragmentFlags, Overflow,
-};
-use crate::incremental::RelayoutMode;
-use crate::layout_debug;
-use crate::model::{
-    AdjoiningMargins, CollapsibleMargins, IntrinsicISizes, MarginCollapseInfo, MaybeAuto,
-};
-use crate::sequential;
-use crate::traversal::PreorderFlowTraversal;
-use app_units::{Au, MAX_AU};
-use euclid::default::{Point2D, Rect, SideOffsets2D, Size2D};
-use gfx_traits::print_tree::PrintTree;
-use serde::{Serialize, Serializer};
-use servo_geometry::MaxRect;
 use std::cmp::{max, min};
 use std::fmt;
 use std::sync::Arc;
+
+use app_units::{Au, MAX_AU};
+use bitflags::bitflags;
+use euclid::default::{Point2D, Rect, SideOffsets2D, Size2D};
+use gfx_traits::print_tree::PrintTree;
+use log::{debug, trace};
+use serde::{Serialize, Serializer};
+use servo_geometry::MaxRect;
 use style::computed_values::box_sizing::T as BoxSizing;
 use style::computed_values::display::T as Display;
 use style::computed_values::float::T as Float;
@@ -68,6 +47,28 @@ use style::logical_geometry::{LogicalMargin, LogicalPoint, LogicalRect, LogicalS
 use style::properties::ComputedValues;
 use style::servo::restyle_damage::ServoRestyleDamage;
 use style::values::computed::{LengthPercentageOrAuto, MaxSize, Size};
+
+use crate::context::LayoutContext;
+use crate::display_list::items::DisplayListSection;
+use crate::display_list::{
+    BorderPaintingMode, DisplayListBuildState, StackingContextCollectionFlags,
+    StackingContextCollectionState,
+};
+use crate::floats::{ClearType, FloatKind, Floats, PlacementInfo};
+use crate::flow::{
+    BaseFlow, EarlyAbsolutePositionInfo, Flow, FlowClass, FlowFlags, ForceNonfloatedFlag,
+    FragmentationContext, GetBaseFlow, ImmutableFlowUtils, LateAbsolutePositionInfo, OpaqueFlow,
+};
+use crate::flow_list::FlowList;
+use crate::fragment::{
+    CoordinateSystem, Fragment, FragmentBorderBoxIterator, FragmentFlags, Overflow,
+};
+use crate::incremental::RelayoutMode;
+use crate::model::{
+    AdjoiningMargins, CollapsibleMargins, IntrinsicISizes, MarginCollapseInfo, MaybeAuto,
+};
+use crate::traversal::PreorderFlowTraversal;
+use crate::{layout_debug, layout_debug_scope, sequential};
 
 /// Information specific to floated blocks.
 #[derive(Clone, Serialize)]
@@ -603,10 +604,11 @@ pub struct BlockFlow {
 }
 
 bitflags! {
+    #[derive(Clone, Copy)]
     struct BlockFlowFlags: u8 {
-        #[doc = "If this is set, then this block flow is the root flow."]
+        /// If this is set, then this block flow is the root flow.
         const IS_ROOT = 0b0000_0001;
-        #[doc = "If this is set, then this block flow has overflow and it will scroll."]
+        /// If this is set, then this block flow has overflow and it will scroll.
         const HAS_SCROLLING_OVERFLOW = 0b0000_0010;
     }
 }
@@ -903,7 +905,7 @@ impl BlockFlow {
     ///   10.6.7.
     ///
     /// For absolute flows, we store the calculated content block-size for the flow. We defer the
-    /// calculation of the other values until a later traversal.
+    /// calculation of the other values until a later traversal at root flow.
     ///
     /// When `fragmentation_context` is given (not `None`), this should fit as much of the content
     /// as possible within the available block size.
@@ -1200,6 +1202,8 @@ impl BlockFlow {
                 .contains(FlowFlags::IS_ABSOLUTELY_POSITIONED)
             {
                 self.propagate_early_absolute_position_info_to_children();
+                // Return early until the absolute flow tree traversal at root flow.
+                // Assigning block size for absolute flow will happen in `traverse_absolute_flows` below.
                 return None;
             }
 
@@ -1661,9 +1665,7 @@ impl BlockFlow {
             //
             // TODO(#2265, pcwalton): Do this in the cascade instead.
             let containing_block_text_align = self.fragment.style().get_inherited_text().text_align;
-            kid.mut_base()
-                .flags
-                .set_text_align(containing_block_text_align);
+            kid.mut_base().text_align = containing_block_text_align;
 
             // Handle `text-indent` on behalf of any inline children that we have. This is
             // necessary because any percentages are relative to the containing block, which only
@@ -1760,7 +1762,11 @@ impl BlockFlow {
         }
 
         // If you remove the might_have_floats_in conditional, this will go off.
-        debug_assert!(!self.is_inline_flex_item());
+        // TODO(servo#30572) revert to debug_assert!() once underlying bug is fixed
+        #[cfg(debug_assertions)]
+        if !(!self.is_inline_flex_item()) {
+            log::warn!("debug assertion failed! !self.is_inline_flex_item()");
+        }
 
         // Compute the available space for us, based on the actual floats.
         let rect = self.base.floats.available_rect(
@@ -1994,6 +2000,7 @@ impl BlockFlow {
                 "block"
             }
         );
+        trace!("BlockFlow before assigning: {:?}", &self);
 
         self.base.floats = Floats::new(self.base.writing_mode);
 
@@ -2003,7 +2010,9 @@ impl BlockFlow {
         // Now compute the real value.
         self.propagate_and_compute_used_inline_size(shared_context);
 
-        self.guess_inline_size_for_block_formatting_context_if_necessary()
+        self.guess_inline_size_for_block_formatting_context_if_necessary();
+
+        trace!("BlockFlow after assigning: {:?}", &self);
     }
 
     /// If this is the root flow, initialize values that would normally be set by the parent.
@@ -2304,25 +2313,32 @@ impl Flow for BlockFlow {
             self.base.flags.contains(FlowFlags::MARGINS_CANNOT_COLLAPSE)
         {
             // Root element margins should never be collapsed according to CSS § 8.3.1.
+            debug!("{}", self.is_root());
             debug!(
-                "assign_block_size: assigning block_size for root flow {:?}",
+                "assign_block_size: assigning block_size for root flow {:#x?}",
                 self.base().debug_id()
             );
-            self.assign_block_size_block_base(
+            trace!("BlockFlow before assigning: {:?}", &self);
+            let flow = self.assign_block_size_block_base(
                 layout_context,
                 fragmentation_context,
                 MarginsMayCollapseFlag::MarginsMayNotCollapse,
-            )
+            );
+            trace!("BlockFlow after assigning: {:?}", &self);
+            flow
         } else {
             debug!(
-                "assign_block_size: assigning block_size for block {:?}",
+                "assign_block_size: assigning block_size for block {:#x?}",
                 self.base().debug_id()
             );
-            self.assign_block_size_block_base(
+            trace!("BlockFlow before assigning: {:?}", &self);
+            let flow = self.assign_block_size_block_base(
                 layout_context,
                 fragmentation_context,
                 MarginsMayCollapseFlag::MarginsMayCollapse,
-            )
+            );
+            trace!("BlockFlow after assigning: {:?}", &self);
+            flow
         }
     }
 
@@ -2958,7 +2974,7 @@ pub trait ISizeAndMarginsComputer {
         // Check for direction of parent flow (NOT Containing Block)
         let block_mode = block.base.writing_mode;
         let container_mode = block.base.block_container_writing_mode;
-        let block_align = block.base.flags.text_align();
+        let block_align = block.base.text_align;
 
         // FIXME (mbrubeck): Handle vertical writing modes.
         let parent_has_same_direction = container_mode.is_bidi_ltr() == block_mode.is_bidi_ltr();

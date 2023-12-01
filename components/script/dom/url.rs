@@ -2,24 +2,27 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+use std::default::Default;
+
+use dom_struct::dom_struct;
+use js::rust::HandleObject;
+use net_traits::blob_url_store::{get_blob_origin, parse_blob_url};
+use net_traits::filemanager_thread::FileManagerThreadMsg;
+use net_traits::{CoreResourceMsg, IpcSend};
+use profile_traits::ipc;
+use servo_url::ServoUrl;
+use uuid::Uuid;
+
 use crate::dom::bindings::cell::DomRefCell;
 use crate::dom::bindings::codegen::Bindings::URLBinding::URLMethods;
 use crate::dom::bindings::error::{Error, ErrorResult, Fallible};
-use crate::dom::bindings::reflector::{reflect_dom_object, DomObject, Reflector};
+use crate::dom::bindings::reflector::{reflect_dom_object_with_proto, DomObject, Reflector};
 use crate::dom::bindings::root::{DomRoot, MutNullableDom};
 use crate::dom::bindings::str::{DOMString, USVString};
 use crate::dom::blob::Blob;
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::urlhelper::UrlHelper;
 use crate::dom::urlsearchparams::URLSearchParams;
-use dom_struct::dom_struct;
-use net_traits::blob_url_store::{get_blob_origin, parse_blob_url};
-use net_traits::filemanager_thread::FileManagerThreadMsg;
-use net_traits::{CoreResourceMsg, IpcSend};
-use profile_traits::ipc;
-use servo_url::ServoUrl;
-use std::default::Default;
-use uuid::Uuid;
 
 // https://url.spec.whatwg.org/#url
 #[dom_struct]
@@ -27,6 +30,7 @@ pub struct URL {
     reflector_: Reflector,
 
     // https://url.spec.whatwg.org/#concept-url-url
+    #[no_trace]
     url: DomRefCell<ServoUrl>,
 
     // https://url.spec.whatwg.org/#dom-url-searchparams
@@ -42,8 +46,8 @@ impl URL {
         }
     }
 
-    pub fn new(global: &GlobalScope, url: ServoUrl) -> DomRoot<URL> {
-        reflect_dom_object(Box::new(URL::new_inherited(url)), global)
+    fn new(global: &GlobalScope, proto: Option<HandleObject>, url: ServoUrl) -> DomRoot<URL> {
+        reflect_dom_object_with_proto(Box::new(URL::new_inherited(url)), global, proto)
     }
 
     pub fn query_pairs(&self) -> Vec<(String, String)> {
@@ -74,41 +78,63 @@ impl URL {
     // https://url.spec.whatwg.org/#constructors
     pub fn Constructor(
         global: &GlobalScope,
+        proto: Option<HandleObject>,
         url: USVString,
         base: Option<USVString>,
     ) -> Fallible<DomRoot<URL>> {
+        // Step 1. Parse url with base.
         let parsed_base = match base {
-            None => {
-                // Step 1.
-                None
-            },
-            Some(base) =>
-            // Step 2.1.
-            {
+            None => None,
+            Some(base) => {
                 match ServoUrl::parse(&base.0) {
                     Ok(base) => Some(base),
                     Err(error) => {
-                        // Step 2.2.
+                        // Step 2. Throw a TypeError if URL parsing fails.
                         return Err(Error::Type(format!("could not parse base: {}", error)));
                     },
                 }
             },
         };
-        // Step 3.
         let parsed_url = match ServoUrl::parse_with_base(parsed_base.as_ref(), &url.0) {
             Ok(url) => url,
             Err(error) => {
-                // Step 4.
+                // Step 2. Throw a TypeError if URL parsing fails.
                 return Err(Error::Type(format!("could not parse URL: {}", error)));
             },
         };
-        // Step 5: Skip (see step 8 below).
-        // Steps 6-7.
-        let result = URL::new(global, parsed_url);
-        // Step 8: Instead of construcing a new `URLSearchParams` object here, construct it
-        //         on-demand inside `URL::SearchParams`.
-        // Step 9.
-        Ok(result)
+
+        // Skip the steps below.
+        // Instead of construcing a new `URLSearchParams` object here, construct it
+        // on-demand inside `URL::SearchParams`.
+        //
+        // Step 3. Let query be parsedURL’s query.
+        // Step 5. Set this’s query object to a new URLSearchParams object.
+        // Step 6. Initialize this’s query object with query.
+        // Step 7. Set this’s query object’s URL object to this.
+
+        // Step 4. Set this’s URL to parsedURL.
+        Ok(URL::new(global, proto, parsed_url))
+    }
+
+    // https://url.spec.whatwg.org/#dom-url-canparse
+    pub fn CanParse(_global: &GlobalScope, url: USVString, base: Option<USVString>) -> bool {
+        // Step 1.
+        let parsed_base = match base {
+            None => None,
+            Some(base) => match ServoUrl::parse(&base.0) {
+                Ok(base) => Some(base),
+                Err(_) => {
+                    // Step 2.1
+                    return false;
+                },
+            },
+        };
+        match ServoUrl::parse_with_base(parsed_base.as_ref(), &url.0) {
+            // Step 3
+            Ok(_) => true,
+            // Step 2.2
+            Err(_) => false,
+        }
     }
 
     // https://w3c.github.io/FileAPI/#dfn-createObjectURL

@@ -2,11 +2,14 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-use serde_json::Value;
 use std::collections::HashMap;
+use std::convert::TryInto;
 use std::fmt;
 use std::str::FromStr;
-use std::sync::{Arc, RwLock};
+use std::sync::RwLock;
+
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub enum PrefValue {
@@ -14,6 +17,7 @@ pub enum PrefValue {
     Int(i64),
     Str(String),
     Bool(bool),
+    Array(Vec<PrefValue>),
     Missing,
 }
 
@@ -147,6 +151,36 @@ impl_from_pref! {
     PrefValue::Bool => bool,
 }
 
+impl From<[f64; 4]> for PrefValue {
+    fn from(other: [f64; 4]) -> PrefValue {
+        PrefValue::Array(IntoIterator::into_iter(other).map(|v| v.into()).collect())
+    }
+}
+
+impl From<PrefValue> for [f64; 4] {
+    fn from(other: PrefValue) -> [f64; 4] {
+        match other {
+            PrefValue::Array(values) if values.len() == 4 => {
+                let mut f = values.into_iter().map(|v| v.try_into());
+                if f.all(|v| v.is_ok()) {
+                    let f = f.flatten().collect::<Vec<f64>>();
+                    return [f[0], f[1], f[2], f[3]];
+                } else {
+                    panic!(
+                        "Cannot convert PrefValue to {:?}",
+                        std::any::type_name::<[f64; 4]>()
+                    )
+                }
+            },
+            _ => panic!(
+                "Cannot convert {:?} to {:?}",
+                other,
+                std::any::type_name::<[f64; 4]>()
+            ),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum PrefError {
     NoSuchPref(String),
@@ -184,7 +218,7 @@ impl<P, V> Accessor<P, V> {
 }
 
 pub struct Preferences<'m, P> {
-    user_prefs: Arc<RwLock<P>>,
+    user_prefs: RwLock<P>,
     default_prefs: P,
     accessors: &'m HashMap<String, Accessor<P, PrefValue>>,
 }
@@ -194,15 +228,15 @@ impl<'m, P: Clone> Preferences<'m, P> {
     /// can always be restored using `reset` or `reset_all`.
     pub fn new(default_prefs: P, accessors: &'m HashMap<String, Accessor<P, PrefValue>>) -> Self {
         Self {
-            user_prefs: Arc::new(RwLock::new(default_prefs.clone())),
+            user_prefs: RwLock::new(default_prefs.clone()),
             default_prefs,
             accessors,
         }
     }
 
     /// Access to the data structure holding the preference values.
-    pub fn values(&self) -> Arc<RwLock<P>> {
-        Arc::clone(&self.user_prefs)
+    pub fn values(&self) -> &RwLock<P> {
+        &self.user_prefs
     }
 
     /// Retrieve a preference using its key

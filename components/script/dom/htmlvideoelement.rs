@@ -2,6 +2,27 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+use std::cell::Cell;
+use std::sync::{Arc, Mutex};
+
+use dom_struct::dom_struct;
+use euclid::default::Size2D;
+use html5ever::{local_name, LocalName, Prefix};
+use ipc_channel::ipc;
+use ipc_channel::router::ROUTER;
+use js::rust::HandleObject;
+use net_traits::image_cache::{
+    ImageCache, ImageCacheResult, ImageOrMetadataAvailable, ImageResponse, PendingImageId,
+    UsePlaceholder,
+};
+use net_traits::request::{CredentialsMode, Destination, RequestBuilder};
+use net_traits::{
+    CoreResourceMsg, FetchChannels, FetchMetadata, FetchResponseListener, FetchResponseMsg,
+    NetworkError, ResourceFetchTiming, ResourceTimingType,
+};
+use servo_media::player::video::VideoFrame;
+use servo_url::ServoUrl;
+
 use crate::document_loader::{LoadBlocker, LoadType};
 use crate::dom::attr::Attr;
 use crate::dom::bindings::cell::DomRefCell;
@@ -21,24 +42,6 @@ use crate::dom::virtualmethods::VirtualMethods;
 use crate::fetch::FetchCanceller;
 use crate::image_listener::{generate_cache_listener_for_element, ImageCacheListener};
 use crate::network_listener::{self, NetworkListener, PreInvoke, ResourceTimingListener};
-use dom_struct::dom_struct;
-use euclid::default::Size2D;
-use html5ever::{LocalName, Prefix};
-use ipc_channel::ipc;
-use ipc_channel::router::ROUTER;
-use net_traits::image_cache::{
-    ImageCache, ImageCacheResult, ImageOrMetadataAvailable, ImageResponse, PendingImageId,
-    UsePlaceholder,
-};
-use net_traits::request::{CredentialsMode, Destination, RequestBuilder};
-use net_traits::{
-    CoreResourceMsg, FetchChannels, FetchMetadata, FetchResponseListener, FetchResponseMsg,
-};
-use net_traits::{NetworkError, ResourceFetchTiming, ResourceTimingType};
-use servo_media::player::video::VideoFrame;
-use servo_url::ServoUrl;
-use std::cell::Cell;
-use std::sync::{Arc, Mutex};
 
 const DEFAULT_WIDTH: u32 = 300;
 const DEFAULT_HEIGHT: u32 = 150;
@@ -59,6 +62,7 @@ pub struct HTMLVideoElement {
     load_blocker: DomRefCell<Option<LoadBlocker>>,
     /// A copy of the last frame
     #[ignore_malloc_size_of = "VideoFrame"]
+    #[no_trace]
     last_frame: DomRefCell<Option<VideoFrame>>,
 }
 
@@ -79,17 +83,19 @@ impl HTMLVideoElement {
         }
     }
 
-    #[allow(unrooted_must_root)]
+    #[allow(crown::unrooted_must_root)]
     pub fn new(
         local_name: LocalName,
         prefix: Option<Prefix>,
         document: &Document,
+        proto: Option<HandleObject>,
     ) -> DomRoot<HTMLVideoElement> {
-        Node::reflect_node(
+        Node::reflect_node_with_proto(
             Box::new(HTMLVideoElement::new_inherited(
                 local_name, prefix, document,
             )),
             document,
+            proto,
         )
     }
 
@@ -107,10 +113,6 @@ impl HTMLVideoElement {
 
     pub fn set_video_height(&self, height: u32) {
         self.video_height.set(height);
-    }
-
-    pub fn allow_load_event(&self) {
-        LoadBlocker::terminate(&mut *self.load_blocker.borrow_mut());
     }
 
     pub fn get_current_frame_data(&self) -> Option<(Option<ipc::IpcSharedMemory>, Size2D<u32>)> {
@@ -293,7 +295,19 @@ impl ImageCacheListener for HTMLVideoElement {
     }
 
     fn process_image_response(&self, response: ImageResponse) {
-        self.htmlmediaelement.process_poster_response(response);
+        match response {
+            ImageResponse::Loaded(image, url) => {
+                debug!("Loaded poster image for video element: {:?}", url);
+                self.htmlmediaelement.process_poster_image_loaded(image);
+                LoadBlocker::terminate(&mut *self.load_blocker.borrow_mut());
+            },
+            ImageResponse::MetadataLoaded(..) => {},
+            ImageResponse::PlaceholderLoaded(..) => unreachable!(),
+            ImageResponse::None => {
+                // A failed load should unblock the document load.
+                LoadBlocker::terminate(&mut *self.load_blocker.borrow_mut());
+            },
+        }
     }
 }
 
@@ -351,7 +365,6 @@ impl FetchResponseListener for PosterFrameFetchContext {
     }
 
     fn process_response_eof(&mut self, response: Result<ResourceFetchTiming, NetworkError>) {
-        self.elem.root().allow_load_event();
         self.image_cache
             .notify_pending_response(self.id, FetchResponseMsg::ProcessResponseEOF(response));
     }

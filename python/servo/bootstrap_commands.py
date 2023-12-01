@@ -7,9 +7,8 @@
 # option. This file may not be copied, modified, or distributed
 # except according to those terms.
 
-from __future__ import absolute_import, print_function, unicode_literals
-
 import base64
+import glob
 import json
 import os
 import os.path as path
@@ -18,8 +17,9 @@ import re
 import subprocess
 import sys
 import traceback
-import six.moves.urllib as urllib
-import glob
+import urllib
+
+import toml
 
 from mach.decorators import (
     CommandArgument,
@@ -27,7 +27,8 @@ from mach.decorators import (
     Command,
 )
 
-import servo.bootstrap as bootstrap
+import servo.platform
+
 from servo.command_base import CommandBase, cd, check_call
 from servo.util import delete, download_bytes, download_file, extract, check_hash
 
@@ -41,19 +42,15 @@ class MachCommands(CommandBase):
                      action='store_true',
                      help='Boostrap without confirmation')
     def bootstrap(self, force=False):
-        # This entry point isn't actually invoked, ./mach bootstrap is directly
-        # called by mach (see mach_bootstrap.bootstrap_command_only) so that
+        # Note: This entry point isn't actually invoked by ./mach bootstrap.
+        # ./mach bootstrap calls mach_bootstrap.bootstrap_command_only so that
         # it can install dependencies without needing mach's dependencies
-        return bootstrap.bootstrap(self.context, force=force)
-
-    @Command('bootstrap-salt',
-             description='Install and set up the salt environment.',
-             category='bootstrap')
-    @CommandArgument('--force', '-f',
-                     action='store_true',
-                     help='Boostrap without confirmation')
-    def bootstrap_salt(self, force=False):
-        return bootstrap.bootstrap(self.context, force=force, specific="salt")
+        try:
+            servo.platform.get().bootstrap(force)
+        except NotImplementedError as exception:
+            print(exception)
+            return 1
+        return 0
 
     @Command('bootstrap-gstreamer',
              description='Set up a local copy of the gstreamer libraries (linux only).',
@@ -62,7 +59,12 @@ class MachCommands(CommandBase):
                      action='store_true',
                      help='Boostrap without confirmation')
     def bootstrap_gstreamer(self, force=False):
-        return bootstrap.bootstrap(self.context, force=force, specific="gstreamer")
+        try:
+            servo.platform.get().bootstrap_gstreamer(force)
+        except NotImplementedError as exception:
+            print(exception)
+            return 1
+        return 0
 
     @Command('bootstrap-android',
              description='Install the Android SDK and NDK.',
@@ -281,15 +283,16 @@ class MachCommands(CommandBase):
                      default='1',
                      help='Keep up to this many most recent nightlies')
     def clean_nightlies(self, force=False, keep=None):
-        print("Current Rust version for Servo: {}".format(self.rust_toolchain()))
+        print(f"Current Rust version for Servo: {self.rust_toolchain()}")
         old_toolchains = []
         keep = int(keep)
-        stdout = subprocess.check_output(['git', 'log', '--format=%H', 'rust-toolchain'])
+        stdout = subprocess.check_output(['git', 'log', '--format=%H', 'rust-toolchain.toml'])
         for i, commit_hash in enumerate(stdout.split(), 1):
             if i > keep:
-                toolchain = subprocess.check_output(
-                    ['git', 'show', '%s:rust-toolchain' % commit_hash])
-                old_toolchains.append(toolchain.strip())
+                toolchain_config_text = subprocess.check_output(
+                    ['git', 'show', f'{commit_hash}:rust-toolchain.toml'])
+                toolchain = toml.loads(toolchain_config_text)['toolchain']['channel']
+                old_toolchains.append(toolchain)
 
         removing_anything = False
         stdout = subprocess.check_output(['rustup', 'toolchain', 'list'])
@@ -298,10 +301,10 @@ class MachCommands(CommandBase):
                 if toolchain_with_host.startswith(old):
                     removing_anything = True
                     if force:
-                        print("Removing {}".format(toolchain_with_host))
+                        print(f"Removing {toolchain_with_host}")
                         check_call(["rustup", "uninstall", toolchain_with_host])
                     else:
-                        print("Would remove {}".format(toolchain_with_host))
+                        print(f"Would remove {toolchain_with_host}")
         if not removing_anything:
             print("Nothing to remove.")
         elif not force:

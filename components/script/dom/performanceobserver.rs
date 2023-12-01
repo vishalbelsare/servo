@@ -2,14 +2,21 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+use std::cell::Cell;
+use std::rc::Rc;
+
+use dom_struct::dom_struct;
+use js::jsval::JSVal;
+use js::rust::HandleObject;
+
 use crate::dom::bindings::callback::ExceptionHandling;
 use crate::dom::bindings::cell::DomRefCell;
 use crate::dom::bindings::codegen::Bindings::PerformanceBinding::PerformanceEntryList as DOMPerformanceEntryList;
-use crate::dom::bindings::codegen::Bindings::PerformanceObserverBinding::PerformanceObserverCallback;
-use crate::dom::bindings::codegen::Bindings::PerformanceObserverBinding::PerformanceObserverInit;
-use crate::dom::bindings::codegen::Bindings::PerformanceObserverBinding::PerformanceObserverMethods;
+use crate::dom::bindings::codegen::Bindings::PerformanceObserverBinding::{
+    PerformanceObserverCallback, PerformanceObserverInit, PerformanceObserverMethods,
+};
 use crate::dom::bindings::error::{Error, Fallible};
-use crate::dom::bindings::reflector::{reflect_dom_object, DomObject, Reflector};
+use crate::dom::bindings::reflector::{reflect_dom_object_with_proto, DomObject, Reflector};
 use crate::dom::bindings::root::DomRoot;
 use crate::dom::bindings::str::DOMString;
 use crate::dom::console::Console;
@@ -18,10 +25,6 @@ use crate::dom::performance::PerformanceEntryList;
 use crate::dom::performanceentry::PerformanceEntry;
 use crate::dom::performanceobserverentrylist::PerformanceObserverEntryList;
 use crate::script_runtime::JSContext;
-use dom_struct::dom_struct;
-use js::jsval::JSVal;
-use std::cell::Cell;
-use std::rc::Rc;
 
 /// List of allowed performance entry types, in alphabetical order.
 pub const VALID_ENTRY_TYPES: &'static [&'static str] = &[
@@ -63,22 +66,37 @@ impl PerformanceObserver {
         }
     }
 
-    #[allow(unrooted_must_root)]
     pub fn new(
         global: &GlobalScope,
         callback: Rc<PerformanceObserverCallback>,
         entries: DOMPerformanceEntryList,
     ) -> DomRoot<PerformanceObserver> {
+        Self::new_with_proto(global, None, callback, entries)
+    }
+
+    #[allow(crown::unrooted_must_root)]
+    fn new_with_proto(
+        global: &GlobalScope,
+        proto: Option<HandleObject>,
+        callback: Rc<PerformanceObserverCallback>,
+        entries: DOMPerformanceEntryList,
+    ) -> DomRoot<PerformanceObserver> {
         let observer = PerformanceObserver::new_inherited(callback, DomRefCell::new(entries));
-        reflect_dom_object(Box::new(observer), global)
+        reflect_dom_object_with_proto(Box::new(observer), global, proto)
     }
 
     #[allow(non_snake_case)]
     pub fn Constructor(
         global: &GlobalScope,
+        proto: Option<HandleObject>,
         callback: Rc<PerformanceObserverCallback>,
     ) -> Fallible<DomRoot<PerformanceObserver>> {
-        Ok(PerformanceObserver::new(global, callback, Vec::new()))
+        Ok(PerformanceObserver::new_with_proto(
+            global,
+            proto,
+            callback,
+            Vec::new(),
+        ))
     }
 
     /// Buffer a new performance entry.

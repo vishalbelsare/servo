@@ -2,33 +2,35 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-use super::c_str_to_string;
-use crate::font::{FontHandleMethods, FontMetrics, FontTableMethods};
-use crate::font::{FontTableTag, FractionalPixel, GPOS, GSUB, KERN};
-use crate::platform::font_context::FontContextHandle;
-use crate::platform::font_template::FontTemplateData;
-use crate::text::glyph::GlyphId;
-use crate::text::util::fixed_to_float;
-use app_units::Au;
-use freetype::freetype::FT_Sfnt_Tag;
-use freetype::freetype::{FT_Done_Face, FT_New_Face, FT_New_Memory_Face};
-use freetype::freetype::{FT_F26Dot6, FT_Face, FT_FaceRec};
-use freetype::freetype::{FT_Get_Char_Index, FT_Get_Postscript_Name};
-use freetype::freetype::{FT_Get_Kerning, FT_Get_Sfnt_Table, FT_Load_Sfnt_Table};
-use freetype::freetype::{FT_GlyphSlot, FT_Library, FT_Long, FT_ULong};
-use freetype::freetype::{FT_Int32, FT_Kerning_Mode, FT_STYLE_FLAG_ITALIC};
-use freetype::freetype::{FT_Load_Glyph, FT_Set_Char_Size};
-use freetype::freetype::{FT_SizeRec, FT_Size_Metrics, FT_UInt, FT_Vector};
-use freetype::succeeded;
-use freetype::tt_os2::TT_OS2;
-use servo_atoms::Atom;
 use std::ffi::CString;
 use std::os::raw::{c_char, c_long};
 use std::sync::Arc;
 use std::{mem, ptr};
+
+use app_units::Au;
+use freetype::freetype::{
+    FT_Done_Face, FT_F26Dot6, FT_Face, FT_FaceRec, FT_Get_Char_Index, FT_Get_Kerning,
+    FT_Get_Postscript_Name, FT_Get_Sfnt_Table, FT_GlyphSlot, FT_Int32, FT_Kerning_Mode, FT_Library,
+    FT_Load_Glyph, FT_Load_Sfnt_Table, FT_Long, FT_New_Face, FT_New_Memory_Face, FT_Set_Char_Size,
+    FT_Sfnt_Tag, FT_SizeRec, FT_Size_Metrics, FT_UInt, FT_ULong, FT_Vector, FT_STYLE_FLAG_ITALIC,
+};
+use freetype::succeeded;
+use freetype::tt_os2::TT_OS2;
+use log::debug;
+use servo_atoms::Atom;
 use style::computed_values::font_stretch::T as FontStretch;
 use style::computed_values::font_weight::T as FontWeight;
 use style::values::computed::font::FontStyle;
+
+use super::c_str_to_string;
+use crate::font::{
+    FontHandleMethods, FontMetrics, FontTableMethods, FontTableTag, FractionalPixel, GPOS, GSUB,
+    KERN,
+};
+use crate::platform::font_context::FontContextHandle;
+use crate::platform::font_template::FontTemplateData;
+use crate::text::glyph::GlyphId;
+use crate::text::util::fixed_to_float;
 
 // This constant is not present in the freetype
 // bindings due to bindgen not handling the way
@@ -68,12 +70,15 @@ struct OS2Table {
 }
 
 #[derive(Debug)]
+#[allow(unused)]
 pub struct FontHandle {
     // The font binary. This must stay valid for the lifetime of the font,
     // if the font is created using FT_Memory_Face.
     font_data: Arc<FontTemplateData>,
     face: FT_Face,
-    handle: FontContextHandle,
+    // `context_handle` is unused, but here to ensure that the underlying
+    // FreeTypeLibraryHandle is not dropped.
+    context_handle: FontContextHandle,
     can_do_fast_shaping: bool,
 }
 
@@ -144,7 +149,7 @@ impl FontHandleMethods for FontHandle {
         let mut handle = FontHandle {
             face: face,
             font_data: template,
-            handle: fctx.clone(),
+            context_handle: fctx.clone(),
             can_do_fast_shaping: false,
         };
         // TODO (#11310): Implement basic support for GPOS and GSUB.
@@ -181,11 +186,10 @@ impl FontHandleMethods for FontHandle {
     }
 
     fn style(&self) -> FontStyle {
-        use style::values::generics::font::FontStyle::*;
         if unsafe { (*self.face).style_flags & FT_STYLE_FLAG_ITALIC as c_long != 0 } {
-            Italic
+            FontStyle::ITALIC
         } else {
-            Normal
+            FontStyle::NORMAL
         }
     }
 
@@ -195,13 +199,12 @@ impl FontHandleMethods for FontHandle {
             Some(os2) => os2,
         };
         let weight = os2.us_weight_class as f32;
-        FontWeight(weight.max(1.).min(1000.))
+        FontWeight::from_float(weight)
     }
 
     fn stretchiness(&self) -> FontStretch {
-        use style::values::generics::NonNegative;
         use style::values::specified::font::FontStretchKeyword;
-        let percentage = if let Some(os2) = self.os2_table() {
+        if let Some(os2) = self.os2_table() {
             match os2.us_width_class {
                 1 => FontStretchKeyword::UltraCondensed,
                 2 => FontStretchKeyword::ExtraCondensed,
@@ -217,8 +220,7 @@ impl FontHandleMethods for FontHandle {
         } else {
             FontStretchKeyword::Normal
         }
-        .compute();
-        FontStretch(NonNegative(percentage))
+        .compute()
     }
 
     fn glyph_index(&self, codepoint: char) -> Option<GlyphId> {

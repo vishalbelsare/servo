@@ -4,12 +4,7 @@
 
 //! Traversals over the DOM and flow trees, running the layout computations.
 
-use crate::construct::FlowConstructor;
-use crate::context::LayoutContext;
-use crate::display_list::DisplayListBuildState;
-use crate::flow::{Flow, FlowFlags, GetBaseFlow, ImmutableFlowUtils};
-use crate::wrapper::ThreadSafeLayoutNodeHelpers;
-use crate::wrapper::{GetStyleAndLayoutData, LayoutNodeLayoutData};
+use log::debug;
 use script_layout_interface::wrapper_traits::{LayoutNode, ThreadSafeLayoutNode};
 use servo_config::opts;
 use style::context::{SharedStyleContext, StyleContext};
@@ -17,8 +12,13 @@ use style::data::ElementData;
 use style::dom::{NodeInfo, TElement, TNode};
 use style::selector_parser::RestyleDamage;
 use style::servo::restyle_damage::ServoRestyleDamage;
-use style::traversal::PerLevelTraversalData;
-use style::traversal::{recalc_style_at, DomTraversal};
+use style::traversal::{recalc_style_at, DomTraversal, PerLevelTraversalData};
+
+use crate::construct::FlowConstructor;
+use crate::context::LayoutContext;
+use crate::display_list::DisplayListBuildState;
+use crate::flow::{Flow, FlowFlags, GetBaseFlow, ImmutableFlowUtils};
+use crate::wrapper::{GetStyleAndLayoutData, LayoutNodeLayoutData, ThreadSafeLayoutNodeHelpers};
 
 pub struct RecalcStyleAndConstructFlows<'a> {
     context: LayoutContext<'a>,
@@ -46,7 +46,6 @@ impl<'a, 'dom, E> DomTraversal<E> for RecalcStyleAndConstructFlows<'a>
 where
     E: TElement,
     E::ConcreteNode: LayoutNode<'dom>,
-    E::FontMetricsProvider: Send,
 {
     fn process_preorder<F>(
         &self,
@@ -312,8 +311,8 @@ impl<'a> PostorderFlowTraversal for AssignBSizes<'a> {
     fn should_process(&self, flow: &mut dyn Flow) -> bool {
         let base = flow.base();
         base.restyle_damage.intersects(ServoRestyleDamage::REFLOW_OUT_OF_FLOW | ServoRestyleDamage::REFLOW) &&
-        // The fragmentation countainer is responsible for calling
-        // Flow::fragment recursively
+        // The fragmentation container is responsible for calling
+        // Flow::fragment recursively.
         !base.flags.contains(FlowFlags::CAN_BE_FRAGMENTED)
     }
 }
@@ -346,7 +345,7 @@ pub struct BuildDisplayList<'a> {
 impl<'a> BuildDisplayList<'a> {
     #[inline]
     pub fn traverse(&mut self, flow: &mut dyn Flow) {
-        if flow.has_non_invertible_transform() {
+        if flow.has_non_invertible_transform_or_zero_scale() {
             return;
         }
 

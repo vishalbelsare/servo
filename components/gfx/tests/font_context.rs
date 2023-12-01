@@ -2,6 +2,13 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+use std::cell::Cell;
+use std::collections::HashMap;
+use std::fs::File;
+use std::io::prelude::*;
+use std::path::PathBuf;
+use std::rc::Rc;
+
 use app_units::Au;
 use gfx::font::{
     fallback_font_families, FontDescriptor, FontFamilyDescriptor, FontFamilyName, FontSearchScope,
@@ -11,19 +18,13 @@ use gfx::font_context::{FontContext, FontContextHandle, FontSource};
 use gfx::font_template::FontTemplateDescriptor;
 use servo_arc::Arc;
 use servo_atoms::Atom;
-use std::cell::Cell;
-use std::collections::HashMap;
-use std::fs::File;
-use std::io::prelude::*;
-use std::path::PathBuf;
-use std::rc::Rc;
 use style::properties::longhands::font_variant_caps::computed_value::T as FontVariantCaps;
 use style::properties::style_structs::Font as FontStyleStruct;
 use style::values::computed::font::{
-    FamilyName, FontFamily, FontFamilyList, FontFamilyNameSyntax, FontSize,
+    FamilyName, FontFamily, FontFamilyList, FontFamilyNameSyntax, FontSize, FontStretch, FontStyle,
+    FontWeight, SingleFontFamily,
 };
-use style::values::computed::font::{FontStretch, FontWeight, SingleFontFamily};
-use style::values::generics::font::FontStyle;
+use webrender_api::{FontInstanceKey, FontKey, IdNamespace};
 
 struct TestFontSource {
     handle: FontContextHandle,
@@ -68,12 +69,8 @@ impl TestFontSource {
 }
 
 impl FontSource for TestFontSource {
-    fn get_font_instance(
-        &mut self,
-        _key: webrender_api::FontKey,
-        _size: Au,
-    ) -> webrender_api::FontInstanceKey {
-        webrender_api::FontInstanceKey(webrender_api::IdNamespace(0), 0)
+    fn get_font_instance(&mut self, _key: FontKey, _size: Au) -> FontInstanceKey {
+        FontInstanceKey(IdNamespace(0), 0)
     }
 
     fn font_template(
@@ -89,7 +86,7 @@ impl FontSource for TestFontSource {
             .and_then(|family| family.find_font_for_style(&template_descriptor, handle))
             .map(|template| FontTemplateInfo {
                 font_template: template,
-                font_key: webrender_api::FontKey(webrender_api::IdNamespace(0), 0),
+                font_key: FontKey(IdNamespace(0), 0),
             })
     }
 }
@@ -97,7 +94,7 @@ impl FontSource for TestFontSource {
 fn style() -> FontStyleStruct {
     let mut style = FontStyleStruct {
         font_family: FontFamily::serif(),
-        font_style: FontStyle::Normal,
+        font_style: FontStyle::NORMAL,
         font_variant_caps: FontVariantCaps::Normal,
         font_weight: FontWeight::normal(),
         font_size: FontSize::medium(),
@@ -120,8 +117,11 @@ fn font_family(names: Vec<&str>) -> FontFamily {
         .collect();
 
     FontFamily {
-        families: FontFamilyList::new(names.into_boxed_slice()),
+        families: FontFamilyList {
+            list: names.into_boxed_slice(),
+        },
         is_system_font: false,
+        is_initial: false,
     }
 }
 
@@ -133,7 +133,7 @@ fn test_font_group_is_cached_by_style() {
     let style1 = style();
 
     let mut style2 = style();
-    style2.set_font_style(FontStyle::Italic);
+    style2.set_font_style(FontStyle::ITALIC);
 
     assert_eq!(
         context.font_group(Arc::new(style1.clone())).as_ptr(),
@@ -230,7 +230,7 @@ fn test_font_template_is_cached() {
         template_descriptor: FontTemplateDescriptor {
             weight: FontWeight::normal(),
             stretch: FontStretch::hundred(),
-            style: FontStyle::Normal,
+            style: FontStyle::normal(),
         },
         variant: FontVariantCaps::Normal,
         pt_size: Au(10),

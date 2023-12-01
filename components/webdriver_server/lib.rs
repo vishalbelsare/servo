@@ -6,47 +6,42 @@
 #![crate_type = "rlib"]
 #![deny(unsafe_code)]
 
-#[macro_use]
-extern crate crossbeam_channel;
-#[macro_use]
-extern crate log;
-#[macro_use]
-extern crate serde;
-
 mod actions;
 mod capabilities;
 
-use crate::actions::{InputSourceState, PointerInputState};
-use base64;
+use std::borrow::ToOwned;
+use std::collections::{BTreeMap, HashMap};
+use std::io::Cursor;
+use std::net::{SocketAddr, SocketAddrV4};
+use std::time::Duration;
+use std::{fmt, mem, thread};
+
+use base64::Engine;
 use capabilities::ServoCapabilities;
-use compositing::ConstellationMsg;
-use crossbeam_channel::{after, unbounded, Receiver, Sender};
+use compositing_traits::ConstellationMsg;
+use crossbeam_channel::{after, select, unbounded, Receiver, Sender};
 use euclid::{Rect, Size2D};
 use http::method::Method;
 use image::{DynamicImage, ImageFormat, RgbImage};
 use ipc_channel::ipc::{self, IpcSender};
 use ipc_channel::router::ROUTER;
 use keyboard_types::webdriver::send_keys;
+use log::{debug, info};
 use msg::constellation_msg::{BrowsingContextId, TopLevelBrowsingContextId, TraversalDirection};
 use net_traits::request::Referrer;
 use pixels::PixelFormat;
-use script_traits::webdriver_msg::{LoadStatus, WebDriverCookieError, WebDriverFrameId};
 use script_traits::webdriver_msg::{
-    WebDriverJSError, WebDriverJSResult, WebDriverJSValue, WebDriverScriptCommand,
+    LoadStatus, WebDriverCookieError, WebDriverFrameId, WebDriverJSError, WebDriverJSResult,
+    WebDriverJSValue, WebDriverScriptCommand,
 };
 use script_traits::{LoadData, LoadOrigin, WebDriverCommandMsg};
-use serde::de::{Deserialize, Deserializer, MapAccess, Visitor};
-use serde::ser::{Serialize, Serializer};
+use serde::de::{Deserializer, MapAccess, Visitor};
+use serde::ser::Serializer;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use servo_config::{prefs, prefs::PrefValue};
+use servo_config::prefs;
+use servo_config::prefs::PrefValue;
 use servo_url::ServoUrl;
-use std::borrow::ToOwned;
-use std::collections::{BTreeMap, HashMap};
-use std::fmt;
-use std::mem;
-use std::net::{SocketAddr, SocketAddrV4};
-use std::thread;
-use std::time::Duration;
 use style_traits::CSSPixel;
 use uuid::Uuid;
 use webdriver::actions::{
@@ -54,23 +49,22 @@ use webdriver::actions::{
     PointerUpAction,
 };
 use webdriver::capabilities::{Capabilities, CapabilitiesMatching};
-use webdriver::command::{ActionsParameters, SwitchToWindowParameters};
 use webdriver::command::{
-    AddCookieParameters, GetParameters, JavascriptCommandParameters, LocatorParameters,
-};
-use webdriver::command::{
-    NewSessionParameters, SendKeysParameters, SwitchToFrameParameters, TimeoutsParameters,
-};
-use webdriver::command::{
-    WebDriverCommand, WebDriverExtensionCommand, WebDriverMessage, WindowRectParameters,
+    ActionsParameters, AddCookieParameters, GetParameters, JavascriptCommandParameters,
+    LocatorParameters, NewSessionParameters, SendKeysParameters, SwitchToFrameParameters,
+    SwitchToWindowParameters, TimeoutsParameters, WebDriverCommand, WebDriverExtensionCommand,
+    WebDriverMessage, WindowRectParameters,
 };
 use webdriver::common::{Cookie, Date, LocatorStrategy, Parameters, WebElement};
 use webdriver::error::{ErrorStatus, WebDriverError, WebDriverResult};
 use webdriver::httpapi::WebDriverExtensionRoute;
-use webdriver::response::{CookieResponse, CookiesResponse};
-use webdriver::response::{ElementRectResponse, NewSessionResponse, ValueResponse};
-use webdriver::response::{TimeoutsResponse, WebDriverResponse, WindowRectResponse};
+use webdriver::response::{
+    CookieResponse, CookiesResponse, ElementRectResponse, NewSessionResponse, TimeoutsResponse,
+    ValueResponse, WebDriverResponse, WindowRectResponse,
+};
 use webdriver::server::{self, Session, SessionTeardownKind, WebDriverHandler};
+
+use crate::actions::{InputSourceState, PointerInputState};
 
 fn extension_routes() -> Vec<(Method, &'static str, ServoExtensionRoute)> {
     return vec![
@@ -114,8 +108,9 @@ pub fn start_server(port: u16, constellation_chan: Sender<ConstellationMsg>) {
         .spawn(move || {
             let address = SocketAddrV4::new("0.0.0.0".parse().unwrap(), port);
             match server::start(
-                "localhost".to_owned(),
                 SocketAddr::V4(address),
+                vec![],
+                vec![],
                 handler,
                 extension_routes(),
             ) {
@@ -288,6 +283,11 @@ impl Serialize for WebDriverPrefValue {
             PrefValue::Float(f) => serializer.serialize_f64(f),
             PrefValue::Int(i) => serializer.serialize_i64(i),
             PrefValue::Missing => serializer.serialize_unit(),
+            PrefValue::Array(ref v) => v
+                .iter()
+                .map(|value| WebDriverPrefValue(value.clone()))
+                .collect::<Vec<WebDriverPrefValue>>()
+                .serialize(serializer),
         }
     }
 }
@@ -1509,15 +1509,22 @@ impl Handler {
                     let pointer_move_action = PointerMoveAction {
                         duration: None,
                         origin: PointerOrigin::Element(WebElement(element_id)),
-                        x: Some(0),
-                        y: Some(0),
+                        x: 0,
+                        y: 0,
+                        ..Default::default()
                     };
 
                     // Steps 8.7 - 8.8
-                    let pointer_down_action = PointerDownAction { button: 1 };
+                    let pointer_down_action = PointerDownAction {
+                        button: 1,
+                        ..Default::default()
+                    };
 
                     // Steps 8.9 - 8.10
-                    let pointer_up_action = PointerUpAction { button: 1 };
+                    let pointer_up_action = PointerUpAction {
+                        button: 1,
+                        ..Default::default()
+                    };
 
                     // Step 8.11
                     if let Err(error) =
@@ -1589,12 +1596,12 @@ impl Handler {
         );
 
         let rgb = RgbImage::from_raw(img.width, img.height, img.bytes.to_vec()).unwrap();
-        let mut png_data = Vec::new();
+        let mut png_data = Cursor::new(Vec::new());
         DynamicImage::ImageRgb8(rgb)
             .write_to(&mut png_data, ImageFormat::Png)
             .unwrap();
 
-        Ok(base64::encode(&png_data))
+        Ok(base64::engine::general_purpose::STANDARD.encode(png_data.get_ref()))
     }
 
     fn handle_take_screenshot(&self) -> WebDriverResult<WebDriverResponse> {

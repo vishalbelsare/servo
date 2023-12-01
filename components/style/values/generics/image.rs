@@ -8,6 +8,7 @@
 
 use crate::custom_properties;
 use crate::values::generics::position::PositionComponent;
+use crate::values::generics::Optional;
 use crate::values::serialize_atom_identifier;
 use crate::Atom;
 use crate::Zero;
@@ -43,7 +44,7 @@ pub enum GenericImage<G, MozImageRect, ImageUrl, Color, Percentage, Resolution> 
 
     /// A paint worklet image.
     /// <https://drafts.css-houdini.org/css-paint-api/>
-    #[cfg(feature = "servo-layout-2013")]
+    #[cfg(feature = "servo")]
     PaintWorklet(PaintWorklet),
 
     /// A `<cross-fade()>` image. Storing this directly inside of
@@ -71,20 +72,6 @@ pub struct GenericCrossFade<Image, Color, Percentage> {
     pub elements: crate::OwnedSlice<GenericCrossFadeElement<Image, Color, Percentage>>,
 }
 
-/// A `<percent> | none` value. Represents optional percentage values
-/// assosicated with cross-fade images.
-#[derive(
-    Clone, Debug, MallocSizeOf, PartialEq, ToComputedValue, ToResolvedValue, ToShmem, ToCss,
-)]
-#[repr(C, u8)]
-pub enum PercentOrNone<Percentage> {
-    /// `none` variant.
-    #[css(skip)]
-    None,
-    /// A percentage variant.
-    Percent(Percentage),
-}
-
 /// An optional percent and a cross fade image.
 #[derive(
     Clone, Debug, MallocSizeOf, PartialEq, ToComputedValue, ToResolvedValue, ToShmem, ToCss,
@@ -92,7 +79,7 @@ pub enum PercentOrNone<Percentage> {
 #[repr(C)]
 pub struct GenericCrossFadeElement<Image, Color, Percentage> {
     /// The percent of the final image that `image` will be.
-    pub percent: PercentOrNone<Percentage>,
+    pub percent: Optional<Percentage>,
     /// A color or image that will be blended when cross-fade is
     /// evaluated.
     pub image: GenericCrossFadeImage<Image, Color>,
@@ -121,7 +108,7 @@ pub use self::GenericCrossFadeImage as CrossFadeImage;
 #[css(comma, function = "image-set")]
 #[repr(C)]
 pub struct GenericImageSet<Image, Resolution> {
-    /// The index of the selected candidate. Zero for specified values.
+    /// The index of the selected candidate. usize::MAX for specified values or invalid images.
     #[css(skip)]
     pub selected_index: usize,
 
@@ -131,9 +118,7 @@ pub struct GenericImageSet<Image, Resolution> {
 }
 
 /// An optional percent and a cross fade image.
-#[derive(
-    Clone, Debug, MallocSizeOf, PartialEq, ToComputedValue, ToResolvedValue, ToShmem, ToCss,
-)]
+#[derive(Clone, Debug, MallocSizeOf, PartialEq, ToComputedValue, ToResolvedValue, ToShmem)]
 #[repr(C)]
 pub struct GenericImageSetItem<Image, Resolution> {
     /// `<image>`. `<string>` is converted to `Image::Url` at parse time.
@@ -142,7 +127,32 @@ pub struct GenericImageSetItem<Image, Resolution> {
     ///
     /// TODO: Skip serialization if it is 1x.
     pub resolution: Resolution,
-    // TODO: type() function.
+
+    /// The `type(<string>)`
+    /// (Optional) Specify the image's MIME type
+    pub mime_type: crate::OwnedStr,
+
+    /// True if mime_type has been specified
+    pub has_mime_type: bool,
+}
+
+impl<I: style_traits::ToCss, R: style_traits::ToCss> ToCss for GenericImageSetItem<I, R> {
+    fn to_css<W>(&self, dest: &mut CssWriter<W>) -> fmt::Result
+    where
+        W: fmt::Write,
+    {
+        self.image.to_css(dest)?;
+        dest.write_char(' ')?;
+        self.resolution.to_css(dest)?;
+
+        if self.has_mime_type {
+            dest.write_char(' ')?;
+            dest.write_str("type(")?;
+            self.mime_type.to_css(dest)?;
+            dest.write_char(')')?;
+        }
+        Ok(())
+    }
 }
 
 pub use self::GenericImageSet as ImageSet;
@@ -359,7 +369,7 @@ impl ToCss for PaintWorklet {
             dest.write_str(", ")?;
             argument.to_css(dest)?;
         }
-        dest.write_str(")")
+        dest.write_char(')')
     }
 }
 
@@ -417,13 +427,13 @@ where
             Image::Url(ref url) => url.to_css(dest),
             Image::Gradient(ref gradient) => gradient.to_css(dest),
             Image::Rect(ref rect) => rect.to_css(dest),
-            #[cfg(feature = "servo-layout-2013")]
+            #[cfg(feature = "servo")]
             Image::PaintWorklet(ref paint_worklet) => paint_worklet.to_css(dest),
             #[cfg(feature = "gecko")]
             Image::Element(ref selector) => {
                 dest.write_str("-moz-element(#")?;
                 serialize_atom_identifier(selector, dest)?;
-                dest.write_str(")")
+                dest.write_char(')')
             },
             Image::ImageSet(ref is) => is.to_css(dest),
             Image::CrossFade(ref cf) => cf.to_css(dest),
@@ -510,7 +520,7 @@ where
                     if !omit_shape {
                         shape.to_css(dest)?;
                         if !omit_position {
-                            dest.write_str(" ")?;
+                            dest.write_char(' ')?;
                         }
                     }
                     if !omit_position {
@@ -550,7 +560,7 @@ where
                     dest.write_str("from ")?;
                     angle.to_css(dest)?;
                     if !omit_position {
-                        dest.write_str(" ")?;
+                        dest.write_char(' ')?;
                     }
                 }
                 if !omit_position {
@@ -567,7 +577,7 @@ where
                 }
             },
         }
-        dest.write_str(")")
+        dest.write_char(')')
     }
 }
 

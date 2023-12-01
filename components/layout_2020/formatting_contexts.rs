@@ -2,22 +2,26 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+use std::convert::TryInto;
+
+use serde::Serialize;
+use servo_arc::Arc;
+use style::logical_geometry::WritingMode;
+use style::properties::ComputedValues;
+use style::values::computed::Length;
+use style::values::specified::text::TextDecorationLine;
+
 use crate::context::LayoutContext;
-use crate::dom_traversal::{Contents, NodeAndStyleInfo, NodeExt};
+use crate::dom::NodeExt;
+use crate::dom_traversal::{Contents, NodeAndStyleInfo};
 use crate::flexbox::FlexContainer;
 use crate::flow::BlockFormattingContext;
-use crate::fragments::{Fragment, Tag};
+use crate::fragment_tree::{BaseFragmentInfo, Fragment};
 use crate::positioned::PositioningContext;
 use crate::replaced::ReplacedContent;
 use crate::sizing::{self, ContentSizes};
 use crate::style_ext::DisplayInside;
 use crate::ContainingBlock;
-use servo_arc::Arc;
-use std::convert::TryInto;
-use style::logical_geometry::WritingMode;
-use style::properties::ComputedValues;
-use style::values::computed::{Length, Percentage};
-use style::values::specified::text::TextDecorationLine;
 
 /// https://drafts.csswg.org/css-display/#independent-formatting-context
 #[derive(Debug, Serialize)]
@@ -28,7 +32,7 @@ pub(crate) enum IndependentFormattingContext {
 
 #[derive(Debug, Serialize)]
 pub(crate) struct NonReplacedFormattingContext {
-    pub tag: Tag,
+    pub base_fragment_info: BaseFragmentInfo,
     #[serde(skip_serializing)]
     pub style: Arc<ComputedValues>,
     /// If it was requested during construction
@@ -38,7 +42,7 @@ pub(crate) struct NonReplacedFormattingContext {
 
 #[derive(Debug, Serialize)]
 pub(crate) struct ReplacedFormattingContext {
-    pub tag: Tag,
+    pub base_fragment_info: BaseFragmentInfo,
     #[serde(skip_serializing)]
     pub style: Arc<ComputedValues>,
     pub contents: ReplacedContent,
@@ -63,7 +67,7 @@ pub(crate) struct IndependentLayout {
 impl IndependentFormattingContext {
     pub fn construct<'dom>(
         context: &LayoutContext,
-        info: &NodeAndStyleInfo<impl NodeExt<'dom>>,
+        node_and_style_info: &NodeAndStyleInfo<impl NodeExt<'dom>>,
         display_inside: DisplayInside,
         contents: Contents,
         propagated_text_decoration_line: TextDecorationLine,
@@ -76,7 +80,7 @@ impl IndependentFormattingContext {
                         NonReplacedFormattingContextContents::Flow(
                             BlockFormattingContext::construct(
                                 context,
-                                info,
+                                node_and_style_info,
                                 non_replaced,
                                 propagated_text_decoration_line,
                                 is_list_item,
@@ -86,37 +90,37 @@ impl IndependentFormattingContext {
                     DisplayInside::Flex => {
                         NonReplacedFormattingContextContents::Flex(FlexContainer::construct(
                             context,
-                            info,
+                            node_and_style_info,
                             non_replaced,
                             propagated_text_decoration_line,
                         ))
                     },
                 };
                 Self::NonReplaced(NonReplacedFormattingContext {
-                    tag: Tag::from_node_and_style_info(info),
-                    style: Arc::clone(&info.style),
+                    base_fragment_info: node_and_style_info.into(),
+                    style: Arc::clone(&node_and_style_info.style),
                     content_sizes: None,
                     contents,
                 })
             },
             Err(contents) => Self::Replaced(ReplacedFormattingContext {
-                tag: Tag::from_node_and_style_info(info),
-                style: Arc::clone(&info.style),
+                base_fragment_info: node_and_style_info.into(),
+                style: Arc::clone(&node_and_style_info.style),
                 contents,
             }),
         }
     }
 
     pub fn construct_for_text_runs<'dom>(
-        info: &NodeAndStyleInfo<impl NodeExt<'dom>>,
+        node_and_style_info: &NodeAndStyleInfo<impl NodeExt<'dom>>,
         runs: impl Iterator<Item = crate::flow::inline::TextRun>,
         propagated_text_decoration_line: TextDecorationLine,
     ) -> Self {
         let bfc =
             BlockFormattingContext::construct_for_text_runs(runs, propagated_text_decoration_line);
         Self::NonReplaced(NonReplacedFormattingContext {
-            tag: Tag::from_node_and_style_info(info),
-            style: Arc::clone(&info.style),
+            base_fragment_info: node_and_style_info.into(),
+            style: Arc::clone(&node_and_style_info.style),
             content_sizes: None,
             contents: NonReplacedFormattingContextContents::Flow(bfc),
         })
@@ -129,14 +133,14 @@ impl IndependentFormattingContext {
         }
     }
 
-    pub fn tag(&self) -> Tag {
+    pub fn base_fragment_info(&self) -> BaseFragmentInfo {
         match self {
-            Self::NonReplaced(inner) => inner.tag,
-            Self::Replaced(inner) => inner.tag,
+            Self::NonReplaced(inner) => inner.base_fragment_info,
+            Self::Replaced(inner) => inner.base_fragment_info,
         }
     }
 
-    pub fn inline_content_sizes(&mut self, layout_context: &LayoutContext) -> ContentSizes {
+    pub fn inline_content_sizes(&self, layout_context: &LayoutContext) -> ContentSizes {
         match self {
             Self::NonReplaced(inner) => inner
                 .contents
@@ -150,25 +154,12 @@ impl IndependentFormattingContext {
         layout_context: &LayoutContext,
         containing_block_writing_mode: WritingMode,
     ) -> ContentSizes {
-        let (mut outer, percentages) = self.outer_inline_content_sizes_and_percentages(
-            layout_context,
-            containing_block_writing_mode,
-        );
-        outer.adjust_for_pbm_percentages(percentages);
-        outer
-    }
-
-    pub fn outer_inline_content_sizes_and_percentages(
-        &mut self,
-        layout_context: &LayoutContext,
-        containing_block_writing_mode: WritingMode,
-    ) -> (ContentSizes, Percentage) {
         match self {
             Self::NonReplaced(non_replaced) => {
                 let style = &non_replaced.style;
                 let content_sizes = &mut non_replaced.content_sizes;
                 let contents = &non_replaced.contents;
-                sizing::outer_inline_and_percentages(&style, containing_block_writing_mode, || {
+                sizing::outer_inline(&style, containing_block_writing_mode, || {
                     content_sizes
                         .get_or_insert_with(|| {
                             contents.inline_content_sizes(layout_context, style.writing_mode)
@@ -176,11 +167,11 @@ impl IndependentFormattingContext {
                         .clone()
                 })
             },
-            Self::Replaced(replaced) => sizing::outer_inline_and_percentages(
-                &replaced.style,
-                containing_block_writing_mode,
-                || replaced.contents.inline_content_sizes(&replaced.style),
-            ),
+            Self::Replaced(replaced) => {
+                sizing::outer_inline(&replaced.style, containing_block_writing_mode, || {
+                    replaced.contents.inline_content_sizes(&replaced.style)
+                })
+            },
         }
     }
 }
@@ -191,21 +182,14 @@ impl NonReplacedFormattingContext {
         layout_context: &LayoutContext,
         positioning_context: &mut PositioningContext,
         containing_block: &ContainingBlock,
-        tree_rank: usize,
     ) -> IndependentLayout {
         match &self.contents {
-            NonReplacedFormattingContextContents::Flow(bfc) => bfc.layout(
-                layout_context,
-                positioning_context,
-                containing_block,
-                tree_rank,
-            ),
-            NonReplacedFormattingContextContents::Flex(fc) => fc.layout(
-                layout_context,
-                positioning_context,
-                containing_block,
-                tree_rank,
-            ),
+            NonReplacedFormattingContextContents::Flow(bfc) => {
+                bfc.layout(layout_context, positioning_context, containing_block)
+            },
+            NonReplacedFormattingContextContents::Flex(fc) => {
+                fc.layout(layout_context, positioning_context, containing_block)
+            },
         }
     }
 

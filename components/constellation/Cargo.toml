@@ -12,38 +12,39 @@ path = "lib.rs"
 
 [dependencies]
 background_hang_monitor = { path = "../background_hang_monitor" }
-backtrace = "0.3"
-bluetooth_traits = { path = "../bluetooth_traits" }
-canvas_traits = { path = "../canvas_traits" }
-compositing = { path = "../compositing" }
-crossbeam-channel = "0.4"
-devtools_traits = { path = "../devtools_traits" }
-embedder_traits = { path = "../embedder_traits" }
-euclid = "0.20"
+backtrace = { workspace = true }
+bluetooth_traits = { workspace = true }
+canvas_traits = { workspace = true }
+compositing_traits = { workspace = true }
+crossbeam-channel = { workspace = true }
+devtools_traits = { workspace = true }
+embedder_traits = { workspace = true }
+euclid = { workspace = true }
 gfx = { path = "../gfx" }
-gfx_traits = { path = "../gfx_traits" }
-http = "0.2"
-headers = "0.3"
-ipc-channel = "0.14"
-keyboard-types = "0.5"
-layout_traits = { path = "../layout_traits" }
-log = "0.4"
+gfx_traits = { workspace = true }
+http = { workspace = true }
+headers = { workspace = true }
+ipc-channel = { workspace = true }
+keyboard-types = { workspace = true }
+layout_traits = { workspace = true }
+log = { workspace = true }
 media = { path = "../media" }
 metrics = { path = "../metrics" }
-msg = { path = "../msg" }
+msg = { workspace = true }
 net = { path = "../net" }
-net_traits = { path = "../net_traits" }
-profile_traits = { path = "../profile_traits" }
-script_traits = { path = "../script_traits" }
-serde = "1.0"
+net_traits = { workspace = true }
+profile_traits = { workspace = true }
+script_traits = { workspace = true }
+serde = { workspace = true }
 servo_config = { path = "../config" }
-servo_rand = {path = "../rand" }
+servo_rand = { path = "../rand" }
 servo_remutex = { path = "../remutex" }
 servo_url = { path = "../url" }
-style_traits = { path = "../style_traits" }
+style_traits = { workspace = true }
 webgpu = { path = "../webgpu" }
-webrender_api = { git = "https://github.com/servo/webrender" }
-webrender_traits = { path = "../webrender_traits" }
+webrender = { workspace = true }
+webrender_api = { workspace = true }
+webrender_traits = { workspace = true }
 webxr-api = { git = "https://github.com/servo/webxr", features = ["ipc"] }
 
 [target.'cfg(any(target_os="macos", all(not(target_os = "windows"), not(target_os = "ios"), not(target_os="android"), not(target_arch="arm"), not(target_arch="aarch64"))))'.dependencies]

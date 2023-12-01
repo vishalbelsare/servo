@@ -2,24 +2,26 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-use crate::geom::flow_relative;
-use crate::geom::{LengthOrAuto, LengthPercentageOrAuto, PhysicalSides, PhysicalSize};
-use crate::ContainingBlock;
 use style::computed_values::mix_blend_mode::T as ComputedMixBlendMode;
 use style::computed_values::position::T as ComputedPosition;
 use style::computed_values::transform_style::T as ComputedTransformStyle;
 use style::logical_geometry::WritingMode;
 use style::properties::longhands::backface_visibility::computed_value::T as BackfaceVisiblity;
 use style::properties::longhands::box_sizing::computed_value::T as BoxSizing;
+use style::properties::longhands::column_span::computed_value::T as ColumnSpan;
 use style::properties::ComputedValues;
 use style::values::computed::image::Image as ComputedImageLayer;
-use style::values::computed::{Length, LengthPercentage};
-use style::values::computed::{NonNegativeLengthPercentage, Size};
+use style::values::computed::{Length, LengthPercentage, NonNegativeLengthPercentage, Size};
 use style::values::generics::box_::Perspective;
 use style::values::generics::length::MaxSize;
 use style::values::specified::box_ as stylo;
 use style::Zero;
 use webrender_api as wr;
+
+use crate::geom::{
+    LengthOrAuto, LengthPercentageOrAuto, LogicalSides, LogicalVec2, PhysicalSides, PhysicalSize,
+};
+use crate::ContainingBlock;
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub(crate) enum Display {
@@ -54,13 +56,25 @@ pub(crate) enum DisplayInside {
 }
 
 /// Percentages resolved but not `auto` margins
+#[derive(Clone)]
 pub(crate) struct PaddingBorderMargin {
-    pub padding: flow_relative::Sides<Length>,
-    pub border: flow_relative::Sides<Length>,
-    pub margin: flow_relative::Sides<LengthOrAuto>,
+    pub padding: LogicalSides<Length>,
+    pub border: LogicalSides<Length>,
+    pub margin: LogicalSides<LengthOrAuto>,
 
     /// Pre-computed sums in each axis
-    pub padding_border_sums: flow_relative::Vec2<Length>,
+    pub padding_border_sums: LogicalVec2<Length>,
+}
+
+impl PaddingBorderMargin {
+    pub(crate) fn zero() -> Self {
+        Self {
+            padding: LogicalSides::zero(),
+            border: LogicalSides::zero(),
+            margin: LogicalSides::zero(),
+            padding_border_sums: LogicalVec2::zero(),
+        }
+    }
 }
 
 pub(crate) trait ComputedValuesExt {
@@ -69,51 +83,49 @@ pub(crate) trait ComputedValuesExt {
     fn box_offsets(
         &self,
         containing_block: &ContainingBlock,
-    ) -> flow_relative::Sides<LengthPercentageOrAuto<'_>>;
+    ) -> LogicalSides<LengthPercentageOrAuto<'_>>;
     fn box_size(
         &self,
         containing_block_writing_mode: WritingMode,
-    ) -> flow_relative::Vec2<LengthPercentageOrAuto<'_>>;
+    ) -> LogicalVec2<LengthPercentageOrAuto<'_>>;
     fn min_box_size(
         &self,
         containing_block_writing_mode: WritingMode,
-    ) -> flow_relative::Vec2<LengthPercentageOrAuto<'_>>;
+    ) -> LogicalVec2<LengthPercentageOrAuto<'_>>;
     fn max_box_size(
         &self,
         containing_block_writing_mode: WritingMode,
-    ) -> flow_relative::Vec2<Option<&LengthPercentage>>;
+    ) -> LogicalVec2<Option<&LengthPercentage>>;
     fn content_box_size(
         &self,
         containing_block: &ContainingBlock,
         pbm: &PaddingBorderMargin,
-    ) -> flow_relative::Vec2<LengthOrAuto>;
+    ) -> LogicalVec2<LengthOrAuto>;
     fn content_min_box_size(
         &self,
         containing_block: &ContainingBlock,
         pbm: &PaddingBorderMargin,
-    ) -> flow_relative::Vec2<LengthOrAuto>;
+    ) -> LogicalVec2<LengthOrAuto>;
     fn content_max_box_size(
         &self,
         containing_block: &ContainingBlock,
         pbm: &PaddingBorderMargin,
-    ) -> flow_relative::Vec2<Option<Length>>;
+    ) -> LogicalVec2<Option<Length>>;
     fn padding_border_margin(&self, containing_block: &ContainingBlock) -> PaddingBorderMargin;
     fn padding(
         &self,
         containing_block_writing_mode: WritingMode,
-    ) -> flow_relative::Sides<&LengthPercentage>;
-    fn border_width(
-        &self,
-        containing_block_writing_mode: WritingMode,
-    ) -> flow_relative::Sides<Length>;
+    ) -> LogicalSides<&LengthPercentage>;
+    fn border_width(&self, containing_block_writing_mode: WritingMode) -> LogicalSides<Length>;
     fn margin(
         &self,
         containing_block_writing_mode: WritingMode,
-    ) -> flow_relative::Sides<LengthPercentageOrAuto<'_>>;
+    ) -> LogicalSides<LengthPercentageOrAuto<'_>>;
     fn has_transform_or_perspective(&self) -> bool;
     fn effective_z_index(&self) -> i32;
+    fn establishes_block_formatting_context(&self) -> bool;
     fn establishes_stacking_context(&self) -> bool;
-    fn establishes_containing_block(&self) -> bool;
+    fn establishes_containing_block_for_absolute_descendants(&self) -> bool;
     fn establishes_containing_block_for_all_descendants(&self) -> bool;
     fn background_is_transparent(&self) -> bool;
     fn get_webrender_primitive_flags(&self) -> wr::PrimitiveFlags;
@@ -145,9 +157,9 @@ impl ComputedValuesExt for ComputedValues {
     fn box_offsets(
         &self,
         containing_block: &ContainingBlock,
-    ) -> flow_relative::Sides<LengthPercentageOrAuto<'_>> {
+    ) -> LogicalSides<LengthPercentageOrAuto<'_>> {
         let position = self.get_position();
-        flow_relative::Sides::from_physical(
+        LogicalSides::from_physical(
             &PhysicalSides::new(
                 position.top.as_ref(),
                 position.right.as_ref(),
@@ -161,9 +173,9 @@ impl ComputedValuesExt for ComputedValues {
     fn box_size(
         &self,
         containing_block_writing_mode: WritingMode,
-    ) -> flow_relative::Vec2<LengthPercentageOrAuto<'_>> {
+    ) -> LogicalVec2<LengthPercentageOrAuto<'_>> {
         let position = self.get_position();
-        flow_relative::Vec2::from_physical_size(
+        LogicalVec2::from_physical_size(
             &PhysicalSize::new(
                 size_to_length(&position.width),
                 size_to_length(&position.height),
@@ -175,9 +187,9 @@ impl ComputedValuesExt for ComputedValues {
     fn min_box_size(
         &self,
         containing_block_writing_mode: WritingMode,
-    ) -> flow_relative::Vec2<LengthPercentageOrAuto<'_>> {
+    ) -> LogicalVec2<LengthPercentageOrAuto<'_>> {
         let position = self.get_position();
-        flow_relative::Vec2::from_physical_size(
+        LogicalVec2::from_physical_size(
             &PhysicalSize::new(
                 size_to_length(&position.min_width),
                 size_to_length(&position.min_height),
@@ -189,7 +201,7 @@ impl ComputedValuesExt for ComputedValues {
     fn max_box_size(
         &self,
         containing_block_writing_mode: WritingMode,
-    ) -> flow_relative::Vec2<Option<&LengthPercentage>> {
+    ) -> LogicalVec2<Option<&LengthPercentage>> {
         fn unwrap(max_size: &MaxSize<NonNegativeLengthPercentage>) -> Option<&LengthPercentage> {
             match max_size {
                 MaxSize::LengthPercentage(length) => Some(&length.0),
@@ -197,7 +209,7 @@ impl ComputedValuesExt for ComputedValues {
             }
         }
         let position = self.get_position();
-        flow_relative::Vec2::from_physical_size(
+        LogicalVec2::from_physical_size(
             &PhysicalSize::new(unwrap(&position.max_width), unwrap(&position.max_height)),
             containing_block_writing_mode,
         )
@@ -207,13 +219,13 @@ impl ComputedValuesExt for ComputedValues {
         &self,
         containing_block: &ContainingBlock,
         pbm: &PaddingBorderMargin,
-    ) -> flow_relative::Vec2<LengthOrAuto> {
+    ) -> LogicalVec2<LengthOrAuto> {
         let box_size = self
             .box_size(containing_block.style.writing_mode)
             .percentages_relative_to(containing_block);
         match self.get_position().box_sizing {
             BoxSizing::ContentBox => box_size,
-            BoxSizing::BorderBox => flow_relative::Vec2 {
+            BoxSizing::BorderBox => LogicalVec2 {
                 // These may be negative, but will later be clamped by `min-width`/`min-height`
                 // which is clamped to zero.
                 inline: box_size.inline.map(|i| i - pbm.padding_border_sums.inline),
@@ -226,13 +238,13 @@ impl ComputedValuesExt for ComputedValues {
         &self,
         containing_block: &ContainingBlock,
         pbm: &PaddingBorderMargin,
-    ) -> flow_relative::Vec2<LengthOrAuto> {
+    ) -> LogicalVec2<LengthOrAuto> {
         let min_box_size = self
             .min_box_size(containing_block.style.writing_mode)
             .percentages_relative_to(containing_block);
         match self.get_position().box_sizing {
             BoxSizing::ContentBox => min_box_size,
-            BoxSizing::BorderBox => flow_relative::Vec2 {
+            BoxSizing::BorderBox => LogicalVec2 {
                 // Clamp to zero to make sure the used size components are non-negative
                 inline: min_box_size
                     .inline
@@ -248,7 +260,7 @@ impl ComputedValuesExt for ComputedValues {
         &self,
         containing_block: &ContainingBlock,
         pbm: &PaddingBorderMargin,
-    ) -> flow_relative::Vec2<Option<Length>> {
+    ) -> LogicalVec2<Option<Length>> {
         let max_box_size = self
             .max_box_size(containing_block.style.writing_mode)
             .percentages_relative_to(containing_block);
@@ -257,7 +269,7 @@ impl ComputedValuesExt for ComputedValues {
             BoxSizing::BorderBox => {
                 // This may be negative, but will later be clamped by `min-width`
                 // which itself is clamped to zero.
-                flow_relative::Vec2 {
+                LogicalVec2 {
                     inline: max_box_size
                         .inline
                         .map(|i| i - pbm.padding_border_sums.inline),
@@ -276,7 +288,7 @@ impl ComputedValuesExt for ComputedValues {
             .percentages_relative_to(cbis);
         let border = self.border_width(containing_block.style.writing_mode);
         PaddingBorderMargin {
-            padding_border_sums: flow_relative::Vec2 {
+            padding_border_sums: LogicalVec2 {
                 inline: padding.inline_sum() + border.inline_sum(),
                 block: padding.block_sum() + border.block_sum(),
             },
@@ -291,9 +303,9 @@ impl ComputedValuesExt for ComputedValues {
     fn padding(
         &self,
         containing_block_writing_mode: WritingMode,
-    ) -> flow_relative::Sides<&LengthPercentage> {
+    ) -> LogicalSides<&LengthPercentage> {
         let padding = self.get_padding();
-        flow_relative::Sides::from_physical(
+        LogicalSides::from_physical(
             &PhysicalSides::new(
                 &padding.padding_top.0,
                 &padding.padding_right.0,
@@ -304,17 +316,14 @@ impl ComputedValuesExt for ComputedValues {
         )
     }
 
-    fn border_width(
-        &self,
-        containing_block_writing_mode: WritingMode,
-    ) -> flow_relative::Sides<Length> {
+    fn border_width(&self, containing_block_writing_mode: WritingMode) -> LogicalSides<Length> {
         let border = self.get_border();
-        flow_relative::Sides::from_physical(
+        LogicalSides::from_physical(
             &PhysicalSides::new(
-                border.border_top_width.0,
-                border.border_right_width.0,
-                border.border_bottom_width.0,
-                border.border_left_width.0,
+                border.border_top_width.into(),
+                border.border_right_width.into(),
+                border.border_bottom_width.into(),
+                border.border_left_width.into(),
             ),
             containing_block_writing_mode,
         )
@@ -323,9 +332,9 @@ impl ComputedValuesExt for ComputedValues {
     fn margin(
         &self,
         containing_block_writing_mode: WritingMode,
-    ) -> flow_relative::Sides<LengthPercentageOrAuto<'_>> {
+    ) -> LogicalSides<LengthPercentageOrAuto<'_>> {
         let margin = self.get_margin();
-        flow_relative::Sides::from_physical(
+        LogicalSides::from_physical(
             &PhysicalSides::new(
                 margin.margin_top.as_ref(),
                 margin.margin_right.as_ref(),
@@ -336,8 +345,22 @@ impl ComputedValuesExt for ComputedValues {
         )
     }
 
-    /// Returns true if this style has a transform, or perspective property set.
+    /// Returns true if this style has a transform, or perspective property set and
+    /// it applies to this element.
     fn has_transform_or_perspective(&self) -> bool {
+        // "A transformable element is an element in one of these categories:
+        //   * all elements whose layout is governed by the CSS box model except for
+        //     non-replaced inline boxes, table-column boxes, and table-column-group
+        //     boxes,
+        //   * all SVG paint server elements, the clipPath element  and SVG renderable
+        //     elements with the exception of any descendant element of text content
+        //     elements."
+        // https://drafts.csswg.org/css-transforms/#transformable-element
+        // FIXME(mrobinson): Properly handle tables and replaced elements here.
+        if self.get_box().display.is_inline_flow() {
+            return false;
+        }
+
         !self.get_box().transform.0.is_empty() || self.get_box().perspective != Perspective::None
     }
 
@@ -349,6 +372,25 @@ impl ComputedValuesExt for ComputedValues {
             ComputedPosition::Static => 0,
             _ => self.get_position().z_index.integer_or(0),
         }
+    }
+
+    /// Return true if this style is a normal block and establishes
+    /// a new block formatting context.
+    fn establishes_block_formatting_context(&self) -> bool {
+        if self.get_box().overflow_x.is_scrollable() {
+            return true;
+        }
+
+        if self.get_column().is_multicol() {
+            return true;
+        }
+
+        if self.get_column().column_span == ColumnSpan::All {
+            return true;
+        }
+
+        // TODO: We need to handle CSS Contain here.
+        false
     }
 
     /// Returns true if this fragment establishes a new stacking context and false otherwise.
@@ -395,7 +437,13 @@ impl ComputedValuesExt for ComputedValues {
         !self.get_position().z_index.is_auto()
     }
 
-    fn establishes_containing_block(&self) -> bool {
+    /// Returns true if this style establishes a containing block for absolute
+    /// descendants (`position: absolute`). If this style happens to establish a
+    /// containing block for “all descendants” (ie including `position: fixed`
+    /// descendants) this method will return true, but a true return value does
+    /// not imply that the style establishes a containing block for all descendants.
+    /// Use `establishes_containing_block_for_all_descendants()` instead.
+    fn establishes_containing_block_for_absolute_descendants(&self) -> bool {
         if self.establishes_containing_block_for_all_descendants() {
             return true;
         }
@@ -403,12 +451,12 @@ impl ComputedValuesExt for ComputedValues {
         self.clone_position() != ComputedPosition::Static
     }
 
-    /// Returns true if this style establishes a containing block for all descendants
-    /// including fixed and absolutely positioned ones.
+    /// Returns true if this style establishes a containing block for
+    /// all descendants, including fixed descendants (`position: fixed`).
+    /// Note that this also implies that it establishes a containing block
+    /// for absolute descendants (`position: absolute`).
     fn establishes_containing_block_for_all_descendants(&self) -> bool {
-        if self.get_box().display.outside() != stylo::DisplayOutside::Inline &&
-            self.has_transform_or_perspective()
-        {
+        if self.has_transform_or_perspective() {
             return true;
         }
 
@@ -423,8 +471,8 @@ impl ComputedValuesExt for ComputedValues {
     /// Whether or not this style specifies a non-transparent background.
     fn background_is_transparent(&self) -> bool {
         let background = self.get_background();
-        let color = self.resolve_color(background.background_color);
-        color.alpha == 0 &&
+        let color = self.resolve_color(background.background_color.clone());
+        color.alpha == 0.0 &&
             background
                 .background_image
                 .0
@@ -456,6 +504,18 @@ impl From<stylo::Display> for Display {
             // These should not be values of DisplayInside, but oh well
             stylo::DisplayInside::None => return Display::None,
             stylo::DisplayInside::Contents => return Display::Contents,
+
+            // TODO: Implement support for tables.
+            stylo::DisplayInside::Table |
+            stylo::DisplayInside::TableRowGroup |
+            stylo::DisplayInside::TableColumn |
+            stylo::DisplayInside::TableColumnGroup |
+            stylo::DisplayInside::TableHeaderGroup |
+            stylo::DisplayInside::TableFooterGroup |
+            stylo::DisplayInside::TableRow |
+            stylo::DisplayInside::TableCell => DisplayInside::Flow {
+                is_list_item: packed.is_list_item(),
+            },
         };
         let outside = match packed.outside() {
             stylo::DisplayOutside::Block => DisplayOutside::Block,
@@ -463,6 +523,11 @@ impl From<stylo::Display> for Display {
 
             // This should not be a value of DisplayInside, but oh well
             stylo::DisplayOutside::None => return Display::None,
+
+            // TODO: Implement support for tables.
+            stylo::DisplayOutside::TableCaption | stylo::DisplayOutside::InternalTable => {
+                DisplayOutside::Block
+            },
         };
         Display::GeneratingBox(DisplayGeneratingBox::OutsideInside { outside, inside })
     }

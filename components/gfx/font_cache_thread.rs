@@ -2,29 +2,33 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-use crate::font::{FontFamilyDescriptor, FontFamilyName, FontSearchScope};
-use crate::font_context::FontSource;
-use crate::font_template::{FontTemplate, FontTemplateDescriptor};
-use crate::platform::font_context::FontContextHandle;
-use crate::platform::font_list::for_each_available_family;
-use crate::platform::font_list::for_each_variation;
-use crate::platform::font_list::system_default_family;
-use crate::platform::font_list::SANS_SERIF_FONT_FAMILY;
-use crate::platform::font_template::FontTemplateData;
-use app_units::Au;
-use gfx_traits::{FontData, WebrenderApi};
-use ipc_channel::ipc::{self, IpcReceiver, IpcSender};
-use net_traits::request::{Destination, Referrer, RequestBuilder};
-use net_traits::{fetch_async, CoreResourceThread, FetchResponseMsg};
-use servo_atoms::Atom;
-use servo_url::ServoUrl;
 use std::borrow::ToOwned;
 use std::collections::HashMap;
 use std::ops::Deref;
 use std::sync::{Arc, Mutex};
 use std::{f32, fmt, mem, thread};
+
+use app_units::Au;
+use gfx_traits::{FontData, WebrenderApi};
+use ipc_channel::ipc::{self, IpcReceiver, IpcSender};
+use log::{debug, trace};
+use net_traits::request::{Destination, Referrer, RequestBuilder};
+use net_traits::{fetch_async, CoreResourceThread, FetchResponseMsg};
+use serde::{Deserialize, Serialize};
+use servo_atoms::Atom;
+use servo_url::ServoUrl;
 use style::font_face::{EffectiveSources, Source};
 use style::values::computed::font::FamilyName;
+use webrender_api::{FontInstanceKey, FontKey};
+
+use crate::font::{FontFamilyDescriptor, FontFamilyName, FontSearchScope};
+use crate::font_context::FontSource;
+use crate::font_template::{FontTemplate, FontTemplateDescriptor};
+use crate::platform::font_context::FontContextHandle;
+use crate::platform::font_list::{
+    for_each_available_family, for_each_variation, system_default_family, SANS_SERIF_FONT_FAMILY,
+};
+use crate::platform::font_template::FontTemplateData;
 
 /// A list of font templates that make up a given font family.
 pub struct FontTemplates {
@@ -34,7 +38,26 @@ pub struct FontTemplates {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct FontTemplateInfo {
     pub font_template: Arc<FontTemplateData>,
-    pub font_key: webrender_api::FontKey,
+    pub font_key: FontKey,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct SerializedFontTemplateInfo {
+    pub serialized_font_template: SerializedFontTemplate,
+    pub font_key: FontKey,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct SerializedFontTemplate {
+    identifier: Atom,
+    bytes_receiver: ipc_channel::ipc::IpcBytesReceiver,
+}
+
+impl SerializedFontTemplate {
+    pub fn to_font_template_data(&self) -> FontTemplateData {
+        let font_data = self.bytes_receiver.recv().ok();
+        FontTemplateData::new(self.identifier.clone(), font_data).unwrap()
+    }
 }
 
 impl FontTemplates {
@@ -109,11 +132,7 @@ pub enum Command {
         FontFamilyDescriptor,
         IpcSender<Reply>,
     ),
-    GetFontInstance(
-        webrender_api::FontKey,
-        Au,
-        IpcSender<webrender_api::FontInstanceKey>,
-    ),
+    GetFontInstance(FontKey, Au, IpcSender<FontInstanceKey>),
     AddWebFont(LowercaseString, EffectiveSources, IpcSender<()>),
     AddDownloadedWebFont(LowercaseString, ServoUrl, Vec<u8>, IpcSender<()>),
     Exit(IpcSender<()>),
@@ -123,7 +142,7 @@ pub enum Command {
 /// Reply messages sent from the font cache thread to the FontContext caller.
 #[derive(Debug, Deserialize, Serialize)]
 pub enum Reply {
-    GetFontTemplateReply(Option<FontTemplateInfo>),
+    GetFontTemplateReply(Option<SerializedFontTemplateInfo>),
 }
 
 /// The font cache thread itself. It maintains a list of reference counted
@@ -137,8 +156,8 @@ struct FontCache {
     font_context: FontContextHandle,
     core_resource_thread: CoreResourceThread,
     webrender_api: Box<dyn WebrenderApi>,
-    webrender_fonts: HashMap<Atom, webrender_api::FontKey>,
-    font_instances: HashMap<(webrender_api::FontKey, Au), webrender_api::FontInstanceKey>,
+    webrender_fonts: HashMap<Atom, FontKey>,
+    font_instances: HashMap<(FontKey, Au), FontInstanceKey>,
 }
 
 fn populate_generic_fonts() -> HashMap<FontFamilyName, LowercaseString> {
@@ -177,7 +196,27 @@ impl FontCache {
                 Command::GetFontTemplate(template_descriptor, family_descriptor, result) => {
                     let maybe_font_template =
                         self.find_font_template(&template_descriptor, &family_descriptor);
-                    let _ = result.send(Reply::GetFontTemplateReply(maybe_font_template));
+                    match maybe_font_template {
+                        None => {
+                            let _ = result.send(Reply::GetFontTemplateReply(None));
+                        },
+                        Some(font_template_info) => {
+                            let (bytes_sender, bytes_receiver) =
+                                ipc::bytes_channel().expect("failed to create IPC channel");
+                            let serialized_font_template = SerializedFontTemplate {
+                                identifier: font_template_info.font_template.identifier.clone(),
+                                bytes_receiver,
+                            };
+
+                            let _ = result.send(Reply::GetFontTemplateReply(Some(
+                                SerializedFontTemplateInfo {
+                                    serialized_font_template,
+                                    font_key: font_template_info.font_key,
+                                },
+                            )));
+                            let _ = bytes_sender.send(&*font_template_info.font_template.bytes());
+                        },
+                    };
                 },
                 Command::GetFontInstance(font_key, size, result) => {
                     let webrender_api = &self.webrender_api;
@@ -497,11 +536,7 @@ impl FontCacheThread {
 }
 
 impl FontSource for FontCacheThread {
-    fn get_font_instance(
-        &mut self,
-        key: webrender_api::FontKey,
-        size: Au,
-    ) -> webrender_api::FontInstanceKey {
+    fn get_font_instance(&mut self, key: FontKey, size: Au) -> FontInstanceKey {
         let (response_chan, response_port) = ipc::channel().expect("failed to create IPC channel");
         self.chan
             .send(Command::GetFontInstance(key, size, response_chan))
@@ -545,7 +580,19 @@ impl FontSource for FontCacheThread {
         }
 
         match reply.unwrap() {
-            Reply::GetFontTemplateReply(data) => data,
+            Reply::GetFontTemplateReply(maybe_serialized_font_template_info) => {
+                match maybe_serialized_font_template_info {
+                    None => None,
+                    Some(serialized_font_template_info) => Some(FontTemplateInfo {
+                        font_template: Arc::new(
+                            serialized_font_template_info
+                                .serialized_font_template
+                                .to_font_template_data(),
+                        ),
+                        font_key: serialized_font_template_info.font_key,
+                    }),
+                }
+            },
         }
     }
 }

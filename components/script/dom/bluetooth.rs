@@ -13,7 +13,7 @@ use crate::dom::bindings::codegen::Bindings::BluetoothBinding::BluetoothDataFilt
 use crate::dom::bindings::codegen::Bindings::BluetoothBinding::{BluetoothMethods, RequestDeviceOptions};
 use crate::dom::bindings::codegen::Bindings::BluetoothBinding::BluetoothLEScanFilterInit;
 use crate::dom::bindings::codegen::Bindings::BluetoothPermissionResultBinding::BluetoothPermissionDescriptor;
-use crate::dom::bindings::codegen::Bindings::BluetoothRemoteGATTServerBinding::BluetoothRemoteGATTServerBinding::
+use crate::dom::bindings::codegen::Bindings::BluetoothRemoteGATTServerBinding::BluetoothRemoteGATTServer_Binding::
 BluetoothRemoteGATTServerMethods;
 use crate::dom::bindings::codegen::Bindings::PermissionStatusBinding::{PermissionName, PermissionState};
 use crate::dom::bindings::codegen::UnionTypes::{ArrayBufferViewOrArrayBuffer, StringOrUnsignedLong};
@@ -113,7 +113,7 @@ impl<T> BluetoothContext<T>
 where
     T: AsyncBluetoothListener + DomObject,
 {
-    #[allow(unrooted_must_root)]
+    #[allow(crown::unrooted_must_root)]
     fn response(&mut self, response: BluetoothResponseResult) {
         let promise = self.promise.take().expect("bt promise is missing").root();
 
@@ -287,8 +287,8 @@ where
     T: AsyncBluetoothListener + DomObject + 'static,
     F: FnOnce(StringOrUnsignedLong) -> Fallible<UUID>,
 {
-    let in_realm_proof = AlreadyInRealm::assert(&attribute.global());
-    let p = Promise::new_in_current_realm(&attribute.global(), InRealm::Already(&in_realm_proof));
+    let in_realm_proof = AlreadyInRealm::assert();
+    let p = Promise::new_in_current_realm(InRealm::Already(&in_realm_proof));
 
     let result_uuid = if let Some(u) = uuid {
         // Step 1.
@@ -528,7 +528,7 @@ impl From<BluetoothError> for Error {
 impl BluetoothMethods for Bluetooth {
     // https://webbluetoothcg.github.io/web-bluetooth/#dom-bluetooth-requestdevice
     fn RequestDevice(&self, option: &RequestDeviceOptions, comp: InRealm) -> Rc<Promise> {
-        let p = Promise::new_in_current_realm(&self.global(), comp);
+        let p = Promise::new_in_current_realm(comp);
         // Step 1.
         if (option.filters.is_some() && option.acceptAllDevices) ||
             (option.filters.is_none() && !option.acceptAllDevices)
@@ -546,7 +546,7 @@ impl BluetoothMethods for Bluetooth {
 
     // https://webbluetoothcg.github.io/web-bluetooth/#dom-bluetooth-getavailability
     fn GetAvailability(&self, comp: InRealm) -> Rc<Promise> {
-        let p = Promise::new_in_current_realm(&self.global(), comp);
+        let p = Promise::new_in_current_realm(comp);
         // Step 1. We did not override the method
         // Step 2 - 3. in handle_response
         let sender = response_async(&p, self);
@@ -737,7 +737,7 @@ impl PermissionAlgorithm for Bluetooth {
         // NOTE: Step 3. is in BluetoothPermissionResult's `handle_response` function.
     }
 
-    #[allow(unrooted_must_root)]
+    #[allow(crown::unrooted_must_root)]
     // https://webbluetoothcg.github.io/web-bluetooth/#revoke-bluetooth-access
     fn permission_revoke(
         _descriptor: &BluetoothPermissionDescriptor,

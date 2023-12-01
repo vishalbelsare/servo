@@ -5,11 +5,9 @@
 <%namespace name="helpers" file="/helpers.mako.rs" />
 
 <%helpers:shorthand name="columns"
-                    engines="gecko servo-2013"
+                    engines="gecko servo"
                     sub_properties="column-width column-count"
-                    servo_2013_pref="layout.columns.enabled",
-                    derive_serialize="True"
-                    extra_prefixes="moz:layout.css.prefixes.columns"
+                    servo_pref="layout.columns.enabled"
                     spec="https://drafts.csswg.org/css-multicol/#propdef-columns">
     use crate::properties::longhands::{column_count, column_width};
 
@@ -55,12 +53,25 @@
             })
         }
     }
+
+    impl<'a> ToCss for LonghandsToSerialize<'a> {
+        fn to_css<W>(&self, dest: &mut CssWriter<W>) -> fmt::Result where W: fmt::Write {
+            if self.column_width.is_auto() {
+                return self.column_count.to_css(dest)
+            }
+            self.column_width.to_css(dest)?;
+            if !self.column_count.is_auto() {
+                dest.write_char(' ')?;
+                self.column_count.to_css(dest)?;
+            }
+            Ok(())
+        }
+    }
 </%helpers:shorthand>
 
 <%helpers:shorthand
     name="column-rule"
     engines="gecko"
-    extra_prefixes="moz:layout.css.prefixes.columns"
     sub_properties="column-rule-width column-rule-style column-rule-color"
     derive_serialize="True"
     spec="https://drafts.csswg.org/css-multicol/#propdef-column-rule"

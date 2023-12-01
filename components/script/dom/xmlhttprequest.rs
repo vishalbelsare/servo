@@ -2,23 +2,60 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+use std::borrow::ToOwned;
+use std::cell::Cell;
+use std::default::Default;
+use std::ptr::NonNull;
+use std::str::{self, FromStr};
+use std::sync::{Arc, Mutex};
+use std::{cmp, ptr, slice};
+
+use dom_struct::dom_struct;
+use encoding_rs::{Encoding, UTF_8};
+use euclid::Length;
+use headers::{ContentLength, ContentType, HeaderMapExt};
+use html5ever::serialize;
+use html5ever::serialize::SerializeOpts;
+use http::header::{self, HeaderMap, HeaderName, HeaderValue};
+use http::Method;
+use hyper_serde::Serde;
+use ipc_channel::ipc;
+use ipc_channel::router::ROUTER;
+use js::jsapi::{Heap, JSObject, JS_ClearPendingException};
+use js::jsval::{JSVal, NullValue, UndefinedValue};
+use js::rust::wrappers::JS_ParseJSON;
+use js::rust::HandleObject;
+use js::typedarray::{ArrayBuffer, CreateWith};
+use mime::{self, Mime, Name};
+use net_traits::request::{CredentialsMode, Destination, Referrer, RequestBuilder, RequestMode};
+use net_traits::CoreResourceMsg::Fetch;
+use net_traits::{
+    trim_http_whitespace, FetchChannels, FetchMetadata, FetchResponseListener, FilteredMetadata,
+    NetworkError, ReferrerPolicy, ResourceFetchTiming, ResourceTimingType,
+};
+use script_traits::serializable::BlobImpl;
+use script_traits::DocumentActivity;
+use servo_atoms::Atom;
+use servo_url::ServoUrl;
+use url::Position;
+
 use crate::body::{BodySource, Extractable, ExtractedBody};
 use crate::document_loader::DocumentLoader;
 use crate::dom::bindings::cell::DomRefCell;
 use crate::dom::bindings::codegen::Bindings::WindowBinding::WindowMethods;
-use crate::dom::bindings::codegen::Bindings::XMLHttpRequestBinding::XMLHttpRequestMethods;
-use crate::dom::bindings::codegen::Bindings::XMLHttpRequestBinding::XMLHttpRequestResponseType;
+use crate::dom::bindings::codegen::Bindings::XMLHttpRequestBinding::{
+    XMLHttpRequestMethods, XMLHttpRequestResponseType,
+};
 use crate::dom::bindings::codegen::UnionTypes::DocumentOrXMLHttpRequestBodyInit;
 use crate::dom::bindings::conversions::ToJSValConvertible;
 use crate::dom::bindings::error::{Error, ErrorResult, Fallible};
 use crate::dom::bindings::inheritance::Castable;
 use crate::dom::bindings::refcounted::Trusted;
-use crate::dom::bindings::reflector::{reflect_dom_object, DomObject};
+use crate::dom::bindings::reflector::{reflect_dom_object_with_proto, DomObject};
 use crate::dom::bindings::root::{Dom, DomRoot, MutNullableDom};
 use crate::dom::bindings::str::{is_token, ByteString, DOMString, USVString};
 use crate::dom::blob::{normalize_type_string, Blob};
-use crate::dom::document::DocumentSource;
-use crate::dom::document::{Document, HasBrowsingContext, IsHTMLDocument};
+use crate::dom::document::{Document, DocumentSource, HasBrowsingContext, IsHTMLDocument};
 use crate::dom::event::{Event, EventBubbles, EventCancelable};
 use crate::dom::eventtarget::EventTarget;
 use crate::dom::globalscope::GlobalScope;
@@ -38,43 +75,6 @@ use crate::script_runtime::JSContext;
 use crate::task_source::networking::NetworkingTaskSource;
 use crate::task_source::TaskSourceName;
 use crate::timers::{OneshotTimerCallback, OneshotTimerHandle};
-use dom_struct::dom_struct;
-use encoding_rs::{Encoding, UTF_8};
-use euclid::Length;
-use headers::{ContentLength, ContentType, HeaderMapExt};
-use html5ever::serialize;
-use html5ever::serialize::SerializeOpts;
-use http::header::{self, HeaderMap, HeaderName, HeaderValue};
-use http::Method;
-use hyper_serde::Serde;
-use ipc_channel::ipc;
-use ipc_channel::router::ROUTER;
-use js::jsapi::JS_ClearPendingException;
-use js::jsapi::{Heap, JSObject};
-use js::jsval::{JSVal, NullValue, UndefinedValue};
-use js::rust::wrappers::JS_ParseJSON;
-use js::typedarray::{ArrayBuffer, CreateWith};
-use mime::{self, Mime, Name};
-use net_traits::request::{CredentialsMode, Destination, Referrer, RequestBuilder, RequestMode};
-use net_traits::trim_http_whitespace;
-use net_traits::CoreResourceMsg::Fetch;
-use net_traits::{FetchChannels, FetchMetadata, FilteredMetadata};
-use net_traits::{FetchResponseListener, NetworkError, ReferrerPolicy};
-use net_traits::{ResourceFetchTiming, ResourceTimingType};
-use script_traits::serializable::BlobImpl;
-use script_traits::DocumentActivity;
-use servo_atoms::Atom;
-use servo_url::ServoUrl;
-use std::borrow::ToOwned;
-use std::cell::Cell;
-use std::cmp;
-use std::default::Default;
-use std::ptr;
-use std::ptr::NonNull;
-use std::slice;
-use std::str::{self, FromStr};
-use std::sync::{Arc, Mutex};
-use url::Position;
 
 #[derive(Clone, Copy, Debug, JSTraceable, MallocSizeOf, PartialEq)]
 enum XMLHttpRequestState {
@@ -140,16 +140,22 @@ pub struct XMLHttpRequest {
     #[ignore_malloc_size_of = "Defined in rust-mozjs"]
     response_json: Heap<JSVal>,
     #[ignore_malloc_size_of = "Defined in hyper"]
+    #[no_trace]
     response_headers: DomRefCell<HeaderMap>,
     #[ignore_malloc_size_of = "Defined in hyper"]
+    #[no_trace]
     override_mime_type: DomRefCell<Option<Mime>>,
+    #[no_trace]
     override_charset: DomRefCell<Option<&'static Encoding>>,
 
     // Associated concepts
     #[ignore_malloc_size_of = "Defined in hyper"]
+    #[no_trace]
     request_method: DomRefCell<Method>,
+    #[no_trace]
     request_url: DomRefCell<Option<ServoUrl>>,
     #[ignore_malloc_size_of = "Defined in hyper"]
+    #[no_trace]
     request_headers: DomRefCell<HeaderMap>,
     request_body_len: Cell<usize>,
     sync: Cell<bool>,
@@ -161,7 +167,9 @@ pub struct XMLHttpRequest {
     fetch_time: Cell<i64>,
     generation_id: Cell<GenerationId>,
     response_status: Cell<Result<(), ()>>,
+    #[no_trace]
     referrer: Referrer,
+    #[no_trace]
     referrer_policy: Option<ReferrerPolicy>,
     canceller: DomRefCell<FetchCanceller>,
 }
@@ -213,14 +221,22 @@ impl XMLHttpRequest {
             canceller: DomRefCell::new(Default::default()),
         }
     }
-    pub fn new(global: &GlobalScope) -> DomRoot<XMLHttpRequest> {
-        reflect_dom_object(Box::new(XMLHttpRequest::new_inherited(global)), global)
+
+    fn new(global: &GlobalScope, proto: Option<HandleObject>) -> DomRoot<XMLHttpRequest> {
+        reflect_dom_object_with_proto(
+            Box::new(XMLHttpRequest::new_inherited(global)),
+            global,
+            proto,
+        )
     }
 
     // https://xhr.spec.whatwg.org/#constructors
     #[allow(non_snake_case)]
-    pub fn Constructor(global: &GlobalScope) -> Fallible<DomRoot<XMLHttpRequest>> {
-        Ok(XMLHttpRequest::new(global))
+    pub fn Constructor(
+        global: &GlobalScope,
+        proto: Option<HandleObject>,
+    ) -> Fallible<DomRoot<XMLHttpRequest>> {
+        Ok(XMLHttpRequest::new(global, proto))
     }
 
     fn sync_in_window(&self) -> bool {

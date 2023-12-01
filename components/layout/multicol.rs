@@ -4,6 +4,21 @@
 
 //! CSS Multi-column layout http://dev.w3.org/csswg/css-multicol/
 
+use std::cmp::{max, min};
+use std::fmt;
+use std::sync::Arc;
+
+use app_units::Au;
+use euclid::default::{Point2D, Vector2D};
+use gfx_traits::print_tree::PrintTree;
+use log::{debug, trace};
+use style::logical_geometry::LogicalSize;
+use style::properties::ComputedValues;
+use style::values::computed::length::{
+    MaxSize, NonNegativeLengthOrAuto, NonNegativeLengthPercentageOrNormal, Size,
+};
+use style::values::generics::column::ColumnCount;
+
 use crate::block::BlockFlow;
 use crate::context::LayoutContext;
 use crate::display_list::{DisplayListBuildState, StackingContextCollectionState};
@@ -11,18 +26,6 @@ use crate::floats::FloatKind;
 use crate::flow::{Flow, FlowClass, FragmentationContext, GetBaseFlow, OpaqueFlow};
 use crate::fragment::{Fragment, FragmentBorderBoxIterator, Overflow};
 use crate::ServoArc;
-use app_units::Au;
-use euclid::default::{Point2D, Vector2D};
-use gfx_traits::print_tree::PrintTree;
-use std::cmp::{max, min};
-use std::fmt;
-use std::sync::Arc;
-use style::logical_geometry::LogicalSize;
-use style::properties::ComputedValues;
-use style::values::computed::length::{
-    MaxSize, NonNegativeLengthOrAuto, NonNegativeLengthPercentageOrNormal, Size,
-};
-use style::values::generics::column::ColumnCount;
 
 #[allow(unsafe_code)]
 unsafe impl crate::flow::HasBaseFlow for MulticolFlow {}
@@ -84,6 +87,8 @@ impl Flow for MulticolFlow {
             "assign_inline_sizes({}): assigning inline_size for flow",
             "multicol"
         );
+        trace!("MulticolFlow before assigning: {:?}", &self);
+
         let shared_context = layout_context.shared_context();
         self.block_flow.compute_inline_sizes(shared_context);
 
@@ -106,9 +111,13 @@ impl Flow for MulticolFlow {
                 NonNegativeLengthPercentageOrNormal::LengthPercentage(ref len) => {
                     len.0.to_pixel_length(content_inline_size)
                 },
-                NonNegativeLengthPercentageOrNormal::Normal => {
-                    self.block_flow.fragment.style.get_font().font_size.size()
-                },
+                NonNegativeLengthPercentageOrNormal::Normal => self
+                    .block_flow
+                    .fragment
+                    .style
+                    .get_font()
+                    .font_size
+                    .computed_size(),
             });
 
             let column_style = style.get_column();
@@ -146,10 +155,13 @@ impl Flow for MulticolFlow {
             column_width,
             |_, _, _, _, _, _| {},
         );
+
+        trace!("MulticolFlow after assigning: {:?}", &self);
     }
 
     fn assign_block_size(&mut self, ctx: &LayoutContext) {
         debug!("assign_block_size: assigning block_size for multicol");
+        trace!("MulticolFlow before assigning: {:?}", &self);
 
         let fragmentation_context = Some(FragmentationContext {
             this_fragment_is_empty: true,
@@ -193,6 +205,8 @@ impl Flow for MulticolFlow {
                 None => break,
             };
         }
+
+        trace!("MulticolFlow after assigning: {:?}", &self);
     }
 
     fn compute_stacking_relative_position(&mut self, layout_context: &LayoutContext) {
@@ -289,12 +303,19 @@ impl Flow for MulticolColumnFlow {
             "assign_inline_sizes({}): assigning inline_size for flow",
             "multicol column"
         );
+        trace!("MulticolFlow before assigning: {:?}", &self);
+
         self.block_flow.assign_inline_sizes(layout_context);
+        trace!("MulticolFlow after assigning: {:?}", &self);
     }
 
     fn assign_block_size(&mut self, ctx: &LayoutContext) {
         debug!("assign_block_size: assigning block_size for multicol column");
+        trace!("MulticolFlow before assigning: {:?}", &self);
+
         self.block_flow.assign_block_size(ctx);
+
+        trace!("MulticolFlow after assigning: {:?}", &self);
     }
 
     fn fragment(

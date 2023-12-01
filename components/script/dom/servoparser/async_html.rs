@@ -2,7 +2,28 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-#![allow(unrooted_must_root)]
+#![allow(crown::unrooted_must_root)]
+
+use std::borrow::Cow;
+use std::cell::Cell;
+use std::collections::vec_deque::VecDeque;
+use std::collections::HashMap;
+use std::thread;
+
+use crossbeam_channel::{unbounded, Receiver, Sender};
+use html5ever::buffer_queue::BufferQueue;
+use html5ever::tendril::fmt::UTF8;
+use html5ever::tendril::{SendTendril, StrTendril, Tendril};
+use html5ever::tokenizer::{Tokenizer as HtmlTokenizer, TokenizerOpts, TokenizerResult};
+use html5ever::tree_builder::{
+    ElementFlags, NextParserState, NodeOrText as HtmlNodeOrText, QuirksMode, TreeBuilder,
+    TreeBuilderOpts, TreeSink,
+};
+use html5ever::{
+    local_name, namespace_url, ns, Attribute as HtmlAttribute, ExpandedName, QualName,
+};
+use servo_url::ServoUrl;
+use style::context::QuirksMode as ServoQuirksMode;
 
 use crate::dom::bindings::codegen::Bindings::HTMLTemplateElementBinding::HTMLTemplateElementMethods;
 use crate::dom::bindings::codegen::Bindings::NodeBinding::NodeMethods;
@@ -20,29 +41,13 @@ use crate::dom::node::Node;
 use crate::dom::processinginstruction::ProcessingInstruction;
 use crate::dom::servoparser::{create_element_for_token, ElementAttribute, ParsingAlgorithm};
 use crate::dom::virtualmethods::vtable_for;
-use crossbeam_channel::{unbounded, Receiver, Sender};
-use html5ever::buffer_queue::BufferQueue;
-use html5ever::tendril::fmt::UTF8;
-use html5ever::tendril::{SendTendril, StrTendril, Tendril};
-use html5ever::tokenizer::{Tokenizer as HtmlTokenizer, TokenizerOpts, TokenizerResult};
-use html5ever::tree_builder::{
-    ElementFlags, NextParserState, NodeOrText as HtmlNodeOrText, QuirksMode, TreeSink,
-};
-use html5ever::tree_builder::{TreeBuilder, TreeBuilderOpts};
-use html5ever::{Attribute as HtmlAttribute, ExpandedName, QualName};
-use servo_url::ServoUrl;
-use std::borrow::Cow;
-use std::cell::Cell;
-use std::collections::vec_deque::VecDeque;
-use std::collections::HashMap;
-use std::thread;
-use style::context::QuirksMode as ServoQuirksMode;
 
 type ParseNodeId = usize;
 
 #[derive(Clone, JSTraceable, MallocSizeOf)]
 pub struct ParseNode {
     id: ParseNodeId,
+    #[no_trace]
     qual_name: Option<QualName>,
 }
 
@@ -54,6 +59,7 @@ enum NodeOrText {
 
 #[derive(JSTraceable, MallocSizeOf)]
 struct Attribute {
+    #[no_trace]
     name: QualName,
     value: String,
 }
@@ -67,6 +73,7 @@ enum ParseOperation {
 
     CreateElement {
         node: ParseNodeId,
+        #[no_trace]
         name: QualName,
         attrs: Vec<Attribute>,
         current_line: u64,
@@ -130,6 +137,7 @@ enum ParseOperation {
 
     SetQuirksMode {
         #[ignore_malloc_size_of = "Defined in style"]
+        #[no_trace]
         mode: ServoQuirksMode,
     },
 }
@@ -196,15 +204,18 @@ fn create_buffer_queue(mut buffers: VecDeque<SendTendril<UTF8>>) -> BufferQueue 
 //   |_____________|                         |_______________|
 //
 #[derive(JSTraceable, MallocSizeOf)]
-#[unrooted_must_root_lint::must_root]
+#[crown::unrooted_must_root_lint::must_root]
 pub struct Tokenizer {
     document: Dom<Document>,
     #[ignore_malloc_size_of = "Defined in std"]
+    #[no_trace]
     receiver: Receiver<ToTokenizerMsg>,
     #[ignore_malloc_size_of = "Defined in std"]
+    #[no_trace]
     html_tokenizer_sender: Sender<ToHtmlTokenizerMsg>,
     #[ignore_malloc_size_of = "Defined in std"]
     nodes: HashMap<ParseNodeId, Dom<Node>>,
+    #[no_trace]
     url: ServoUrl,
     parsing_algorithm: ParsingAlgorithm,
 }
@@ -272,7 +283,8 @@ impl Tokenizer {
         tokenizer
     }
 
-    pub fn feed(&mut self, input: &mut BufferQueue) -> Result<(), DomRoot<HTMLScriptElement>> {
+    #[must_use]
+    pub fn feed(&mut self, input: &mut BufferQueue) -> TokenizerResult<DomRoot<HTMLScriptElement>> {
         let mut send_tendrils = VecDeque::new();
         while let Some(str) = input.pop_front() {
             send_tendrils.push_back(SendTendril::from(str));
@@ -296,7 +308,7 @@ impl Tokenizer {
                 ToTokenizerMsg::TokenizerResultDone { updated_input } => {
                     let buffer_queue = create_buffer_queue(updated_input);
                     *input = buffer_queue;
-                    return Ok(());
+                    return TokenizerResult::Done;
                 },
                 ToTokenizerMsg::TokenizerResultScript {
                     script,
@@ -305,7 +317,7 @@ impl Tokenizer {
                     let buffer_queue = create_buffer_queue(updated_input);
                     *input = buffer_queue;
                     let script = self.get_node(&script.id);
-                    return Err(DomRoot::from_ref(script.downcast().unwrap()));
+                    return TokenizerResult::Script(DomRoot::from_ref(script.downcast().unwrap()));
                 },
                 ToTokenizerMsg::End => unreachable!(),
             };
@@ -420,7 +432,7 @@ impl Tokenizer {
                 self.insert_node(node, Dom::from_ref(element.upcast()));
             },
             ParseOperation::CreateComment { text, node } => {
-                let comment = Comment::new(DOMString::from(text), document);
+                let comment = Comment::new(DOMString::from(text), document, None);
                 self.insert_node(node, Dom::from_ref(&comment.upcast()));
             },
             ParseOperation::AppendBeforeSibling { sibling, node } => {
@@ -509,13 +521,6 @@ impl Tokenizer {
 
                 if let Some(control) = control {
                     control.set_form_owner_from_parser(&form);
-                } else {
-                    // TODO remove this code when keygen is implemented.
-                    assert_eq!(
-                        node.NodeName(),
-                        "KEYGEN",
-                        "Unknown form-associatable element"
-                    );
                 }
             },
             ParseOperation::Pop { node } => {
@@ -663,7 +668,7 @@ impl Sink {
     }
 }
 
-#[allow(unrooted_must_root)]
+#[allow(crown::unrooted_must_root)]
 impl TreeSink for Sink {
     type Output = Self;
     fn finish(self) -> Self {

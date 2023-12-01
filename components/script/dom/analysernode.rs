@@ -2,6 +2,15 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+use dom_struct::dom_struct;
+use ipc_channel::ipc::{self, IpcReceiver};
+use ipc_channel::router::ROUTER;
+use js::rust::{CustomAutoRooterGuard, HandleObject};
+use js::typedarray::{Float32Array, Uint8Array};
+use servo_media::audio::analyser_node::AnalysisEngine;
+use servo_media::audio::block::Block;
+use servo_media::audio::node::AudioNodeInit;
+
 use crate::dom::audionode::AudioNode;
 use crate::dom::baseaudiocontext::BaseAudioContext;
 use crate::dom::bindings::cell::DomRefCell;
@@ -14,28 +23,21 @@ use crate::dom::bindings::codegen::Bindings::AudioNodeBinding::{
 use crate::dom::bindings::error::{Error, Fallible};
 use crate::dom::bindings::num::Finite;
 use crate::dom::bindings::refcounted::Trusted;
-use crate::dom::bindings::reflector::reflect_dom_object;
+use crate::dom::bindings::reflector::reflect_dom_object_with_proto;
 use crate::dom::bindings::root::DomRoot;
 use crate::dom::window::Window;
 use crate::task_source::TaskSource;
-use dom_struct::dom_struct;
-use ipc_channel::ipc::{self, IpcReceiver};
-use ipc_channel::router::ROUTER;
-use js::rust::CustomAutoRooterGuard;
-use js::typedarray::{Float32Array, Uint8Array};
-use servo_media::audio::analyser_node::AnalysisEngine;
-use servo_media::audio::block::Block;
-use servo_media::audio::node::AudioNodeInit;
 
 #[dom_struct]
 pub struct AnalyserNode {
     node: AudioNode,
     #[ignore_malloc_size_of = "Defined in servo-media"]
+    #[no_trace]
     engine: DomRefCell<AnalysisEngine>,
 }
 
 impl AnalyserNode {
-    #[allow(unrooted_must_root)]
+    #[allow(crown::unrooted_must_root)]
     pub fn new_inherited(
         _: &Window,
         context: &BaseAudioContext,
@@ -89,14 +91,23 @@ impl AnalyserNode {
         ))
     }
 
-    #[allow(unrooted_must_root)]
     pub fn new(
         window: &Window,
         context: &BaseAudioContext,
         options: &AnalyserOptions,
     ) -> Fallible<DomRoot<AnalyserNode>> {
+        Self::new_with_proto(window, None, context, options)
+    }
+
+    #[allow(crown::unrooted_must_root)]
+    pub fn new_with_proto(
+        window: &Window,
+        proto: Option<HandleObject>,
+        context: &BaseAudioContext,
+        options: &AnalyserOptions,
+    ) -> Fallible<DomRoot<AnalyserNode>> {
         let (node, recv) = AnalyserNode::new_inherited(window, context, options)?;
-        let object = reflect_dom_object(Box::new(node), window);
+        let object = reflect_dom_object_with_proto(Box::new(node), window, proto);
         let (source, canceller) = window
             .task_manager()
             .dom_manipulation_task_source_with_canceller();
@@ -122,10 +133,11 @@ impl AnalyserNode {
     #[allow(non_snake_case)]
     pub fn Constructor(
         window: &Window,
+        proto: Option<HandleObject>,
         context: &BaseAudioContext,
         options: &AnalyserOptions,
     ) -> Fallible<DomRoot<AnalyserNode>> {
-        AnalyserNode::new(window, context, options)
+        AnalyserNode::new_with_proto(window, proto, context, options)
     }
 
     pub fn push_block(&self, block: Block) {

@@ -6,13 +6,13 @@
 
 // TODO: other background-* properties
 <%helpers:shorthand name="background"
-                    engines="gecko servo-2013 servo-2020"
+                    engines="gecko servo"
                     sub_properties="background-color background-position-x background-position-y background-repeat
                                     background-attachment background-image background-size background-origin
                                     background-clip"
                     spec="https://drafts.csswg.org/css-backgrounds/#the-background">
     use crate::properties::longhands::{background_position_x, background_position_y, background_repeat};
-    use crate::properties::longhands::{background_attachment, background_image, background_size, background_origin};
+    use crate::properties::longhands::{background_attachment, background_color, background_image, background_size, background_origin};
     use crate::properties::longhands::background_clip;
     use crate::properties::longhands::background_clip::single_value::computed_value::T as Clip;
     use crate::properties::longhands::background_origin::single_value::computed_value::T as Origin;
@@ -156,35 +156,71 @@
                     dest.write_str(", ")?;
                 }
 
+                let mut wrote_value = false;
+
                 if i == len - 1 {
-                    self.background_color.to_css(dest)?;
-                    dest.write_str(" ")?;
+                    if *self.background_color != background_color::get_initial_specified_value() {
+                        self.background_color.to_css(dest)?;
+                        wrote_value = true;
+                    }
                 }
 
-                image.to_css(dest)?;
+                if *image != background_image::single_value::get_initial_specified_value() {
+                    if wrote_value {
+                        dest.write_char(' ')?;
+                    }
+                    image.to_css(dest)?;
+                    wrote_value = true;
+                }
+
+                // Size is only valid after a position so when there is a
+                // non-initial size we must also serialize position
+                if *position_x != PositionComponent::zero() ||
+                    *position_y != PositionComponent::zero() ||
+                    *size != background_size::single_value::get_initial_specified_value()
+                {
+                    if wrote_value {
+                        dest.write_char(' ')?;
+                    }
+
+                    Position {
+                        horizontal: position_x.clone(),
+                        vertical: position_y.clone()
+                    }.to_css(dest)?;
+
+                    wrote_value = true;
+
+                    if *size != background_size::single_value::get_initial_specified_value() {
+                        dest.write_str(" / ")?;
+                        size.to_css(dest)?;
+                    }
+                }
+
                 % for name in "repeat attachment".split():
-                    dest.write_str(" ")?;
-                    ${name}.to_css(dest)?;
+                    if *${name} != background_${name}::single_value::get_initial_specified_value() {
+                        if wrote_value {
+                            dest.write_char(' ')?;
+                        }
+                        ${name}.to_css(dest)?;
+                        wrote_value = true;
+                    }
                 % endfor
 
-                dest.write_str(" ")?;
-                Position {
-                    horizontal: position_x.clone(),
-                    vertical: position_y.clone()
-                }.to_css(dest)?;
-
-                if *size != background_size::single_value::get_initial_specified_value() {
-                    dest.write_str(" / ")?;
-                    size.to_css(dest)?;
-                }
-
                 if *origin != Origin::PaddingBox || *clip != Clip::BorderBox {
-                    dest.write_str(" ")?;
+                    if wrote_value {
+                        dest.write_char(' ')?;
+                    }
                     origin.to_css(dest)?;
                     if *clip != From::from(*origin) {
-                        dest.write_str(" ")?;
+                        dest.write_char(' ')?;
                         clip.to_css(dest)?;
                     }
+
+                    wrote_value = true;
+                }
+
+                if !wrote_value {
+                    image.to_css(dest)?;
                 }
             }
 
@@ -194,7 +230,7 @@
 </%helpers:shorthand>
 
 <%helpers:shorthand name="background-position"
-                    engines="gecko servo-2013 servo-2020"
+                    engines="gecko servo"
                     flags="SHORTHAND_IN_GETCS"
                     sub_properties="background-position-x background-position-y"
                     spec="https://drafts.csswg.org/css-backgrounds-4/#the-background-position">

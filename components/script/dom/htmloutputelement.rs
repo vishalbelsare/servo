@@ -2,6 +2,10 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+use dom_struct::dom_struct;
+use html5ever::{local_name, LocalName, Prefix};
+use js::rust::HandleObject;
+
 use crate::dom::attr::Attr;
 use crate::dom::bindings::cell::DomRefCell;
 use crate::dom::bindings::codegen::Bindings::HTMLOutputElementBinding::HTMLOutputElementMethods;
@@ -17,8 +21,6 @@ use crate::dom::nodelist::NodeList;
 use crate::dom::validation::Validatable;
 use crate::dom::validitystate::ValidityState;
 use crate::dom::virtualmethods::VirtualMethods;
-use dom_struct::dom_struct;
-use html5ever::{LocalName, Prefix};
 
 #[dom_struct]
 pub struct HTMLOutputElement {
@@ -44,17 +46,19 @@ impl HTMLOutputElement {
         }
     }
 
-    #[allow(unrooted_must_root)]
+    #[allow(crown::unrooted_must_root)]
     pub fn new(
         local_name: LocalName,
         prefix: Option<Prefix>,
         document: &Document,
+        proto: Option<HandleObject>,
     ) -> DomRoot<HTMLOutputElement> {
-        Node::reflect_node(
+        Node::reflect_node_with_proto(
             Box::new(HTMLOutputElement::new_inherited(
                 local_name, prefix, document,
             )),
             document,
+            proto,
         )
     }
 

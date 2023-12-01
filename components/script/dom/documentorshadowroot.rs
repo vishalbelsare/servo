@@ -2,34 +2,35 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-use crate::dom::bindings::cell::DomRefCell;
-use crate::dom::bindings::codegen::Bindings::NodeBinding::NodeBinding::NodeMethods;
-use crate::dom::bindings::inheritance::Castable;
-use crate::dom::bindings::num::Finite;
-use crate::dom::bindings::root::{Dom, DomRoot};
-use crate::dom::element::Element;
-use crate::dom::htmlelement::HTMLElement;
-use crate::dom::htmlmetaelement::HTMLMetaElement;
-use crate::dom::node::{self, Node, VecPreOrderInsertionHelper};
-use crate::dom::window::Window;
-use crate::stylesheet_set::StylesheetSetRef;
+use std::fmt;
+
 use euclid::default::Point2D;
 use script_layout_interface::message::{NodesFromPointQueryType, QueryMsg};
 use script_traits::UntrustedNodeAddress;
 use servo_arc::Arc;
 use servo_atoms::Atom;
-use std::collections::HashMap;
-use std::fmt;
-use style::context::QuirksMode;
 use style::invalidation::media_queries::{MediaListKey, ToMediaListKey};
 use style::media_queries::MediaList;
 use style::shared_lock::{SharedRwLock as StyleSharedRwLock, SharedRwLockReadGuard};
-use style::stylesheets::{CssRule, Origin, Stylesheet};
+use style::stylesheets::{Stylesheet, StylesheetContents};
+
+use super::bindings::trace::HashMapTracedValues;
+use crate::dom::bindings::cell::DomRefCell;
+use crate::dom::bindings::codegen::Bindings::NodeBinding::Node_Binding::NodeMethods;
+use crate::dom::bindings::inheritance::Castable;
+use crate::dom::bindings::num::Finite;
+use crate::dom::bindings::root::{Dom, DomRoot};
+use crate::dom::element::Element;
+use crate::dom::htmlelement::HTMLElement;
+use crate::dom::node::{self, Node, VecPreOrderInsertionHelper};
+use crate::dom::window::Window;
+use crate::stylesheet_set::StylesheetSetRef;
 
 #[derive(Clone, JSTraceable, MallocSizeOf)]
-#[unrooted_must_root_lint::must_root]
+#[crown::unrooted_must_root_lint::must_root]
 pub struct StyleSheetInDocument {
     #[ignore_malloc_size_of = "Arc"]
+    #[no_trace]
     pub sheet: Arc<Stylesheet>,
     pub owner: Dom<Element>,
 }
@@ -48,19 +49,11 @@ impl PartialEq for StyleSheetInDocument {
 
 impl ToMediaListKey for StyleSheetInDocument {
     fn to_media_list_key(&self) -> MediaListKey {
-        self.sheet.to_media_list_key()
+        self.sheet.contents.to_media_list_key()
     }
 }
 
 impl ::style::stylesheets::StylesheetInDocument for StyleSheetInDocument {
-    fn origin(&self, guard: &SharedRwLockReadGuard) -> Origin {
-        self.sheet.origin(guard)
-    }
-
-    fn quirks_mode(&self, guard: &SharedRwLockReadGuard) -> QuirksMode {
-        self.sheet.quirks_mode(guard)
-    }
-
     fn enabled(&self) -> bool {
         self.sheet.enabled()
     }
@@ -69,13 +62,13 @@ impl ::style::stylesheets::StylesheetInDocument for StyleSheetInDocument {
         self.sheet.media(guard)
     }
 
-    fn rules<'a, 'b: 'a>(&'a self, guard: &'b SharedRwLockReadGuard) -> &'a [CssRule] {
-        self.sheet.rules(guard)
+    fn contents(&self) -> &StylesheetContents {
+        self.sheet.contents()
     }
 }
 
 // https://w3c.github.io/webcomponents/spec/shadow/#extensions-to-the-documentorshadowroot-mixin
-#[unrooted_must_root_lint::must_root]
+#[crown::unrooted_must_root_lint::must_root]
 #[derive(JSTraceable, MallocSizeOf)]
 pub struct DocumentOrShadowRoot {
     window: Dom<Window>,
@@ -206,7 +199,7 @@ impl DocumentOrShadowRoot {
     }
 
     /// Remove a stylesheet owned by `owner` from the list of document sheets.
-    #[allow(unrooted_must_root)] // Owner needs to be rooted already necessarily.
+    #[allow(crown::unrooted_must_root)] // Owner needs to be rooted already necessarily.
     pub fn remove_stylesheet(
         owner: &Element,
         s: &Arc<Stylesheet>,
@@ -227,7 +220,7 @@ impl DocumentOrShadowRoot {
 
     /// Add a stylesheet owned by `owner` to the list of document sheets, in the
     /// correct tree position.
-    #[allow(unrooted_must_root)] // Owner needs to be rooted already necessarily.
+    #[allow(crown::unrooted_must_root)] // Owner needs to be rooted already necessarily.
     pub fn add_stylesheet(
         owner: &Element,
         mut stylesheets: StylesheetSetRef<StyleSheetInDocument>,
@@ -235,13 +228,7 @@ impl DocumentOrShadowRoot {
         insertion_point: Option<StyleSheetInDocument>,
         style_shared_lock: &StyleSharedRwLock,
     ) {
-        // FIXME(emilio): It'd be nice to unify more code between the elements
-        // that own stylesheets, but StylesheetOwner is more about loading
-        // them...
-        debug_assert!(
-            owner.as_stylesheet_owner().is_some() || owner.is::<HTMLMetaElement>(),
-            "Wat"
-        );
+        debug_assert!(owner.as_stylesheet_owner().is_some(), "Wat");
 
         let sheet = StyleSheetInDocument {
             sheet,
@@ -263,7 +250,7 @@ impl DocumentOrShadowRoot {
     /// Remove any existing association between the provided id/name and any elements in this document.
     pub fn unregister_named_element(
         &self,
-        id_map: &DomRefCell<HashMap<Atom, Vec<Dom<Element>>>>,
+        id_map: &DomRefCell<HashMapTracedValues<Atom, Vec<Dom<Element>>>>,
         to_unregister: &Element,
         id: &Atom,
     ) {
@@ -291,7 +278,7 @@ impl DocumentOrShadowRoot {
     /// Associate an element present in this document with the provided id/name.
     pub fn register_named_element(
         &self,
-        id_map: &DomRefCell<HashMap<Atom, Vec<Dom<Element>>>>,
+        id_map: &DomRefCell<HashMapTracedValues<Atom, Vec<Dom<Element>>>>,
         element: &Element,
         id: &Atom,
         root: DomRoot<Node>,

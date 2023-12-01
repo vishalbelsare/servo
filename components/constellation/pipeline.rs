@@ -2,14 +2,16 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-use crate::event_loop::EventLoop;
-use crate::sandboxing::{spawn_multiprocess, UnprivilegedContent};
+use std::borrow::Cow;
+use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
+
 use background_hang_monitor::HangMonitorRegister;
 use bluetooth_traits::BluetoothRequest;
 use canvas_traits::webgl::WebGLPipeline;
-use compositing::compositor_thread::Msg as CompositorMsg;
-use compositing::CompositionPipeline;
-use compositing::CompositorProxy;
+use compositing_traits::{CompositionPipeline, CompositorMsg, CompositorProxy};
 use crossbeam_channel::{unbounded, Sender};
 use devtools_traits::{DevtoolsControlMsg, ScriptToDevtoolsControlMsg};
 use embedder_traits::EventLoopWaker;
@@ -18,36 +20,32 @@ use ipc_channel::ipc::{self, IpcReceiver, IpcSender};
 use ipc_channel::router::ROUTER;
 use ipc_channel::Error;
 use layout_traits::LayoutThreadFactory;
+use log::{debug, error, warn};
 use media::WindowGLContext;
 use metrics::PaintTimeMetrics;
-use msg::constellation_msg::TopLevelBrowsingContextId;
 use msg::constellation_msg::{
-    BackgroundHangMonitorControlMsg, BackgroundHangMonitorRegister, HangMonitorAlert,
-};
-use msg::constellation_msg::{BrowsingContextId, HistoryStateId};
-use msg::constellation_msg::{
-    PipelineId, PipelineNamespace, PipelineNamespaceId, PipelineNamespaceRequest,
+    BackgroundHangMonitorControlMsg, BackgroundHangMonitorRegister, BrowsingContextId,
+    HangMonitorAlert, HistoryStateId, PipelineId, PipelineNamespace, PipelineNamespaceId,
+    PipelineNamespaceRequest, TopLevelBrowsingContextId,
 };
 use net::image_cache::ImageCacheImpl;
 use net_traits::image_cache::ImageCache;
 use net_traits::ResourceThreads;
-use profile_traits::mem as profile_mem;
-use profile_traits::time;
+use profile_traits::{mem as profile_mem, time};
 use script_traits::{
-    AnimationState, ConstellationControlMsg, DiscardBrowsingContext, ScriptToConstellationChan,
+    AnimationState, ConstellationControlMsg, DiscardBrowsingContext, DocumentActivity,
+    InitialScriptState, LayoutControlMsg, LayoutMsg, LoadData, NewLayoutInfo, SWManagerMsg,
+    ScriptThreadFactory, ScriptToConstellationChan, TimerSchedulerMsg, WindowSizeData,
 };
-use script_traits::{DocumentActivity, InitialScriptState};
-use script_traits::{LayoutControlMsg, LayoutMsg, LoadData};
-use script_traits::{NewLayoutInfo, SWManagerMsg};
-use script_traits::{ScriptThreadFactory, TimerSchedulerMsg, WindowSizeData};
+use serde::{Deserialize, Serialize};
 use servo_config::opts::{self, Opts};
-use servo_config::{prefs, prefs::PrefValue};
+use servo_config::prefs;
+use servo_config::prefs::PrefValue;
 use servo_url::ServoUrl;
-use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
-use std::rc::Rc;
-use std::sync::atomic::AtomicBool;
-use std::sync::Arc;
+use webrender_api::DocumentId;
+
+use crate::event_loop::EventLoop;
+use crate::sandboxing::{spawn_multiprocess, UnprivilegedContent};
 
 /// A `Pipeline` is the constellation's view of a `Document`. Each pipeline has an
 /// event loop (executed by a script thread) and a layout thread. A script thread
@@ -145,7 +143,7 @@ pub struct InitialPipelineState {
     pub compositor_proxy: CompositorProxy,
 
     /// A channel to the developer tools, if applicable.
-    pub devtools_chan: Option<Sender<DevtoolsControlMsg>>,
+    pub devtools_sender: Option<Sender<DevtoolsControlMsg>>,
 
     /// A channel to the bluetooth thread.
     pub bluetooth_thread: IpcSender<BluetoothRequest>,
@@ -190,7 +188,7 @@ pub struct InitialPipelineState {
     pub webrender_api_sender: script_traits::WebrenderIpcSender,
 
     /// The ID of the document processed by this script thread.
-    pub webrender_document: webrender_api::DocumentId,
+    pub webrender_document: DocumentId,
 
     /// A channel to the WebGL thread.
     pub webgl_chan: Option<WebGLPipeline>,
@@ -249,29 +247,30 @@ impl Pipeline {
                 let (script_chan, script_port) = ipc::channel().expect("Pipeline script chan");
 
                 // Route messages coming from content to devtools as appropriate.
-                let script_to_devtools_chan = state.devtools_chan.as_ref().map(|devtools_chan| {
-                    let (script_to_devtools_chan, script_to_devtools_port) =
-                        ipc::channel().expect("Pipeline script to devtools chan");
-                    let devtools_chan = (*devtools_chan).clone();
-                    ROUTER.add_route(
-                        script_to_devtools_port.to_opaque(),
-                        Box::new(
-                            move |message| match message.to::<ScriptToDevtoolsControlMsg>() {
-                                Err(e) => {
-                                    error!("Cast to ScriptToDevtoolsControlMsg failed ({}).", e)
-                                },
-                                Ok(message) => {
-                                    if let Err(e) =
-                                        devtools_chan.send(DevtoolsControlMsg::FromScript(message))
-                                    {
-                                        warn!("Sending to devtools failed ({:?})", e)
-                                    }
-                                },
-                            },
-                        ),
-                    );
-                    script_to_devtools_chan
-                });
+                let script_to_devtools_ipc_sender =
+                    state.devtools_sender.as_ref().map(|devtools_sender| {
+                        let (script_to_devtools_ipc_sender, script_to_devtools_ipc_receiver) =
+                            ipc::channel().expect("Pipeline script to devtools chan");
+                        let devtools_sender = (*devtools_sender).clone();
+                        ROUTER.add_route(
+                            script_to_devtools_ipc_receiver.to_opaque(),
+                            Box::new(move |message| {
+                                match message.to::<ScriptToDevtoolsControlMsg>() {
+                                    Err(e) => {
+                                        error!("Cast to ScriptToDevtoolsControlMsg failed ({}).", e)
+                                    },
+                                    Ok(message) => {
+                                        if let Err(e) = devtools_sender
+                                            .send(DevtoolsControlMsg::FromScript(message))
+                                        {
+                                            warn!("Sending to devtools failed ({:?})", e)
+                                        }
+                                    },
+                                }
+                            }),
+                        );
+                        script_to_devtools_ipc_sender
+                    });
 
                 let mut unprivileged_pipeline_content = UnprivilegedPipelineContent {
                     id: state.id,
@@ -286,7 +285,7 @@ impl Pipeline {
                         .clone(),
                     bhm_control_port: None,
                     scheduler_chan: state.scheduler_chan,
-                    devtools_chan: script_to_devtools_chan,
+                    devtools_ipc_sender: script_to_devtools_ipc_sender,
                     bluetooth_thread: state.bluetooth_thread,
                     swmanager_thread: state.swmanager_thread,
                     font_cache_thread: state.font_cache_thread,
@@ -325,11 +324,7 @@ impl Pipeline {
                     let register = state
                         .background_monitor_register
                         .expect("Couldn't start content, no background monitor has been initiated");
-                    unprivileged_pipeline_content.start_all::<Message, LTF, STF>(
-                        false,
-                        register,
-                        state.event_loop_waker,
-                    );
+                    unprivileged_pipeline_content.start_all::<Message, LTF, STF>(false, register);
                     None
                 };
 
@@ -496,7 +491,7 @@ pub struct UnprivilegedPipelineContent {
     bhm_control_port: Option<IpcReceiver<BackgroundHangMonitorControlMsg>>,
     layout_to_constellation_chan: IpcSender<LayoutMsg>,
     scheduler_chan: IpcSender<TimerSchedulerMsg>,
-    devtools_chan: Option<IpcSender<ScriptToDevtoolsControlMsg>>,
+    devtools_ipc_sender: Option<IpcSender<ScriptToDevtoolsControlMsg>>,
     bluetooth_thread: IpcSender<BluetoothRequest>,
     swmanager_thread: IpcSender<SWManagerMsg>,
     font_cache_thread: FontCacheThread,
@@ -513,7 +508,7 @@ pub struct UnprivilegedPipelineContent {
     pipeline_namespace_id: PipelineNamespaceId,
     webrender_api_sender: script_traits::WebrenderIpcSender,
     webrender_image_api_sender: net_traits::WebrenderIpcSender,
-    webrender_document: webrender_api::DocumentId,
+    webrender_document: DocumentId,
     webgl_chan: Option<WebGLPipeline>,
     webxr_registry: webxr_api::Registry,
     player_context: WindowGLContext,
@@ -525,7 +520,6 @@ impl UnprivilegedPipelineContent {
         self,
         wait_for_completion: bool,
         background_hang_monitor_register: Box<dyn BackgroundHangMonitorRegister>,
-        event_loop_waker: Option<Box<dyn EventLoopWaker>>,
     ) where
         LTF: LayoutThreadFactory<Message = Message>,
         STF: ScriptThreadFactory<Message = Message>,
@@ -562,7 +556,7 @@ impl UnprivilegedPipelineContent {
                 image_cache: image_cache.clone(),
                 time_profiler_chan: self.time_profiler_chan.clone(),
                 mem_profiler_chan: self.mem_profiler_chan.clone(),
-                devtools_chan: self.devtools_chan,
+                devtools_chan: self.devtools_ipc_sender,
                 window_size: self.window_size,
                 pipeline_namespace_id: self.pipeline_namespace_id,
                 content_process_shutdown_chan: content_process_shutdown_chan,
@@ -572,21 +566,9 @@ impl UnprivilegedPipelineContent {
                 webrender_api_sender: self.webrender_api_sender.clone(),
                 layout_is_busy: layout_thread_busy_flag.clone(),
                 player_context: self.player_context.clone(),
-                event_loop_waker,
                 inherited_secure_context: self.load_data.inherited_secure_context.clone(),
             },
             self.load_data.clone(),
-            self.opts.profile_script_events,
-            self.opts.print_pwm,
-            self.opts.relayout_event,
-            self.opts.output_file.is_some() ||
-                self.opts.exit_after_load ||
-                self.opts.webdriver_port.is_some(),
-            self.opts.unminify_js,
-            self.opts.local_script_source,
-            self.opts.userscripts,
-            self.opts.headless,
-            self.opts.replace_surrogates,
             self.user_agent,
         );
 
@@ -607,16 +589,7 @@ impl UnprivilegedPipelineContent {
             self.webrender_api_sender,
             paint_time_metrics,
             layout_thread_busy_flag.clone(),
-            self.opts.load_webfonts_synchronously,
             self.window_size,
-            self.opts.dump_display_list,
-            self.opts.dump_display_list_json,
-            self.opts.dump_style_tree,
-            self.opts.dump_rule_tree,
-            self.opts.relayout_event,
-            self.opts.nonincremental_layout,
-            self.opts.trace_layout,
-            self.opts.dump_flow_tree,
         );
 
         if wait_for_completion {

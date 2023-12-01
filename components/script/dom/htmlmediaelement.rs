@@ -2,24 +2,62 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+use std::cell::Cell;
+use std::collections::VecDeque;
+use std::rc::Rc;
+use std::sync::{Arc, Mutex};
+use std::{f64, mem};
+
+use dom_struct::dom_struct;
+use embedder_traits::resources::{self, Resource as EmbedderResource};
+use embedder_traits::{MediaPositionState, MediaSessionEvent, MediaSessionPlaybackState};
+use euclid::default::Size2D;
+use headers::{ContentLength, ContentRange, HeaderMapExt};
+use html5ever::{local_name, namespace_url, ns, LocalName, Prefix};
+use http::header::{self, HeaderMap, HeaderValue};
+use ipc_channel::ipc;
+use ipc_channel::router::ROUTER;
+use js::jsapi::JSAutoRealm;
+use media::{glplayer_channel, GLPlayerMsg, GLPlayerMsgForward, WindowGLContext};
+use net_traits::image::base::Image;
+use net_traits::request::Destination;
+use net_traits::{
+    CoreResourceMsg, FetchChannels, FetchMetadata, FetchResponseListener, Metadata, NetworkError,
+    ResourceFetchTiming, ResourceTimingType,
+};
+use script_layout_interface::HTMLMediaData;
+use script_traits::{ImageUpdate, WebrenderIpcSender};
+use servo_config::pref;
+use servo_media::player::audio::AudioRenderer;
+use servo_media::player::video::{VideoFrame, VideoFrameRenderer};
+use servo_media::player::{PlaybackState, Player, PlayerError, PlayerEvent, SeekLock, StreamType};
+use servo_media::{ClientContextId, ServoMedia, SupportsMediaType};
+use servo_url::ServoUrl;
+use time::{self, Duration, Timespec};
+use webrender_api::{
+    ExternalImageData, ExternalImageId, ExternalImageType, ImageBufferKind, ImageData,
+    ImageDescriptor, ImageDescriptorFlags, ImageFormat, ImageKey,
+};
+
 use crate::document_loader::{LoadBlocker, LoadType};
 use crate::dom::attr::Attr;
 use crate::dom::audiotrack::AudioTrack;
 use crate::dom::audiotracklist::AudioTrackList;
 use crate::dom::bindings::cell::DomRefCell;
 use crate::dom::bindings::codegen::Bindings::AttrBinding::AttrMethods;
-use crate::dom::bindings::codegen::Bindings::HTMLMediaElementBinding::CanPlayTypeResult;
-use crate::dom::bindings::codegen::Bindings::HTMLMediaElementBinding::HTMLMediaElementConstants;
-use crate::dom::bindings::codegen::Bindings::HTMLMediaElementBinding::HTMLMediaElementMethods;
+use crate::dom::bindings::codegen::Bindings::HTMLMediaElementBinding::{
+    CanPlayTypeResult, HTMLMediaElementConstants, HTMLMediaElementMethods,
+};
 use crate::dom::bindings::codegen::Bindings::HTMLSourceElementBinding::HTMLSourceElementMethods;
 use crate::dom::bindings::codegen::Bindings::MediaErrorBinding::MediaErrorConstants::*;
 use crate::dom::bindings::codegen::Bindings::MediaErrorBinding::MediaErrorMethods;
-use crate::dom::bindings::codegen::Bindings::NavigatorBinding::NavigatorBinding::NavigatorMethods;
-use crate::dom::bindings::codegen::Bindings::NodeBinding::NodeBinding::NodeMethods;
+use crate::dom::bindings::codegen::Bindings::NavigatorBinding::Navigator_Binding::NavigatorMethods;
+use crate::dom::bindings::codegen::Bindings::NodeBinding::Node_Binding::NodeMethods;
 use crate::dom::bindings::codegen::Bindings::TextTrackBinding::{TextTrackKind, TextTrackMode};
-use crate::dom::bindings::codegen::Bindings::WindowBinding::WindowBinding::WindowMethods;
-use crate::dom::bindings::codegen::InheritTypes::{ElementTypeId, HTMLElementTypeId};
-use crate::dom::bindings::codegen::InheritTypes::{HTMLMediaElementTypeId, NodeTypeId};
+use crate::dom::bindings::codegen::Bindings::WindowBinding::Window_Binding::WindowMethods;
+use crate::dom::bindings::codegen::InheritTypes::{
+    ElementTypeId, HTMLElementTypeId, HTMLMediaElementTypeId, NodeTypeId,
+};
 use crate::dom::bindings::codegen::UnionTypes::{
     MediaStreamOrBlob, VideoTrackOrAudioTrackOrTextTrack,
 };
@@ -34,8 +72,8 @@ use crate::dom::blob::Blob;
 use crate::dom::document::Document;
 use crate::dom::element::{
     cors_setting_for_element, reflect_cross_origin_attribute, set_cross_origin_attribute,
+    AttributeMutation, Element, ElementCreator,
 };
-use crate::dom::element::{AttributeMutation, Element, ElementCreator};
 use crate::dom::event::Event;
 use crate::dom::eventtarget::EventTarget;
 use crate::dom::globalscope::GlobalScope;
@@ -62,42 +100,9 @@ use crate::dom::virtualmethods::VirtualMethods;
 use crate::fetch::{create_a_potential_cors_request, FetchCanceller};
 use crate::microtask::{Microtask, MicrotaskRunnable};
 use crate::network_listener::{self, NetworkListener, PreInvoke, ResourceTimingListener};
-use crate::realms::InRealm;
+use crate::realms::{enter_realm, InRealm};
 use crate::script_thread::ScriptThread;
 use crate::task_source::TaskSource;
-use dom_struct::dom_struct;
-use embedder_traits::resources::{self, Resource as EmbedderResource};
-use embedder_traits::{MediaPositionState, MediaSessionEvent, MediaSessionPlaybackState};
-use euclid::default::Size2D;
-use headers::{ContentLength, ContentRange, HeaderMapExt};
-use html5ever::{LocalName, Prefix};
-use http::header::{self, HeaderMap, HeaderValue};
-use ipc_channel::ipc;
-use ipc_channel::router::ROUTER;
-use media::{glplayer_channel, GLPlayerMsg, GLPlayerMsgForward, WindowGLContext};
-use net_traits::image::base::Image;
-use net_traits::image_cache::ImageResponse;
-use net_traits::request::Destination;
-use net_traits::{CoreResourceMsg, FetchChannels, FetchMetadata, FetchResponseListener, Metadata};
-use net_traits::{NetworkError, ResourceFetchTiming, ResourceTimingType};
-use script_layout_interface::HTMLMediaData;
-use script_traits::{ImageUpdate, WebrenderIpcSender};
-use servo_config::pref;
-use servo_media::player::audio::AudioRenderer;
-use servo_media::player::video::{VideoFrame, VideoFrameRenderer};
-use servo_media::player::{PlaybackState, Player, PlayerError, PlayerEvent, SeekLock, StreamType};
-use servo_media::{ClientContextId, ServoMedia, SupportsMediaType};
-use servo_url::ServoUrl;
-use std::cell::Cell;
-use std::collections::VecDeque;
-use std::f64;
-use std::mem;
-use std::rc::Rc;
-use std::sync::{Arc, Mutex};
-use time::{self, Duration, Timespec};
-use webrender_api::ImageKey;
-use webrender_api::{ExternalImageData, ExternalImageId, ExternalImageType, TextureTarget};
-use webrender_api::{ImageData, ImageDescriptor, ImageDescriptorFlags, ImageFormat};
 
 #[derive(PartialEq)]
 enum FrameStatus {
@@ -225,9 +230,9 @@ impl VideoFrameRenderer for MediaFrameRenderer {
 
                 let image_data = if frame.is_gl_texture() && self.player_id.is_some() {
                     let texture_target = if frame.is_external_oes() {
-                        TextureTarget::External
+                        ImageBufferKind::TextureExternal
                     } else {
-                        TextureTarget::Default
+                        ImageBufferKind::Texture2D
                     };
 
                     ImageData::External(ExternalImageData {
@@ -254,9 +259,9 @@ impl VideoFrameRenderer for MediaFrameRenderer {
 
                 let image_data = if frame.is_gl_texture() && self.player_id.is_some() {
                     let texture_target = if frame.is_external_oes() {
-                        TextureTarget::External
+                        ImageBufferKind::TextureExternal
                     } else {
-                        TextureTarget::Default
+                        ImageBufferKind::Texture2D
                     };
 
                     ImageData::External(ExternalImageData {
@@ -277,7 +282,7 @@ impl VideoFrameRenderer for MediaFrameRenderer {
     }
 }
 
-#[unrooted_must_root_lint::must_root]
+#[crown::unrooted_must_root_lint::must_root]
 #[derive(JSTraceable, MallocSizeOf)]
 enum SrcObject {
     MediaStream(Dom<MediaStream>),
@@ -285,7 +290,7 @@ enum SrcObject {
 }
 
 impl From<MediaStreamOrBlob> for SrcObject {
-    #[allow(unrooted_must_root)]
+    #[allow(crown::unrooted_must_root)]
     fn from(src_object: MediaStreamOrBlob) -> SrcObject {
         match src_object {
             MediaStreamOrBlob::Blob(blob) => SrcObject::Blob(Dom::from_ref(&*blob)),
@@ -333,10 +338,13 @@ pub struct HTMLMediaElement {
     #[ignore_malloc_size_of = "promises are hard"]
     in_flight_play_promises_queue: DomRefCell<VecDeque<(Box<[Rc<Promise>]>, ErrorResult)>>,
     #[ignore_malloc_size_of = "servo_media"]
+    #[no_trace]
     player: DomRefCell<Option<Arc<Mutex<dyn Player>>>>,
     #[ignore_malloc_size_of = "Arc"]
+    #[no_trace]
     video_renderer: Arc<Mutex<MediaFrameRenderer>>,
     #[ignore_malloc_size_of = "Arc"]
+    #[no_trace]
     audio_renderer: DomRefCell<Option<Arc<Mutex<dyn AudioRenderer>>>>,
     /// https://html.spec.whatwg.org/multipage/#show-poster-flag
     show_poster: Cell<bool>,
@@ -353,9 +361,11 @@ pub struct HTMLMediaElement {
     /// https://html.spec.whatwg.org/multipage/#dom-media-muted
     muted: Cell<bool>,
     /// URL of the media resource, if any.
+    #[no_trace]
     resource_url: DomRefCell<Option<ServoUrl>>,
     /// URL of the media resource, if the resource is set through the src_object attribute and it
     /// is a blob.
+    #[no_trace]
     blob_url: DomRefCell<Option<ServoUrl>>,
     /// https://html.spec.whatwg.org/multipage/#dom-media-played
     #[ignore_malloc_size_of = "Rc"]
@@ -368,6 +378,7 @@ pub struct HTMLMediaElement {
     text_tracks_list: MutNullableDom<TextTrackList>,
     /// Time of last timeupdate notification.
     #[ignore_malloc_size_of = "Defined in time"]
+    #[no_trace]
     next_timeupdate_event: Cell<Timespec>,
     /// Latest fetch request context.
     current_fetch_context: DomRefCell<Option<HTMLMediaElementFetchContext>>,
@@ -379,6 +390,7 @@ pub struct HTMLMediaElement {
     /// keeping a whitelist of media controls identifiers.
     media_controls_id: DomRefCell<Option<String>>,
     #[ignore_malloc_size_of = "Defined in other crates"]
+    #[no_trace]
     player_context: WindowGLContext,
 }
 
@@ -1195,9 +1207,9 @@ impl HTMLMediaElement {
     /// does not take a list of promises to fulfill. Callers cannot just pop
     /// the front list off of `in_flight_play_promises_queue` and later fulfill
     /// the promises because that would mean putting
-    /// `#[allow(unrooted_must_root)]` on even more functions, potentially
+    /// `#[allow(crown::unrooted_must_root)]` on even more functions, potentially
     /// hiding actual safety bugs.
-    #[allow(unrooted_must_root)]
+    #[allow(crown::unrooted_must_root)]
     fn fulfill_in_flight_play_promises<F>(&self, f: F)
     where
         F: FnOnce(),
@@ -1306,25 +1318,22 @@ impl HTMLMediaElement {
     }
 
     /// https://html.spec.whatwg.org/multipage/#poster-frame
-    pub fn process_poster_response(&self, image: ImageResponse) {
+    pub fn process_poster_image_loaded(&self, image: Arc<Image>) {
         if !self.show_poster.get() {
             return;
         }
 
         // Step 6.
-        if let ImageResponse::Loaded(image, _) = image {
-            self.video_renderer
-                .lock()
-                .unwrap()
-                .render_poster_frame(image);
-            self.upcast::<Node>().dirty(NodeDamage::OtherNodeDamage);
-            if pref!(media.testing.enabled) {
-                let window = window_from_node(self);
-                let task_source = window.task_manager().media_element_task_source();
-                task_source.queue_simple_event(self.upcast(), atom!("postershown"), &window);
-            } else {
-                return;
-            }
+        self.video_renderer
+            .lock()
+            .unwrap()
+            .render_poster_frame(image);
+        self.upcast::<Node>().dirty(NodeDamage::OtherNodeDamage);
+
+        if pref!(media.testing.enabled) {
+            let window = window_from_node(self);
+            let task_source = window.task_manager().media_element_task_source();
+            task_source.queue_simple_event(self.upcast(), atom!("postershown"), &window);
         }
     }
 
@@ -1868,6 +1877,7 @@ impl HTMLMediaElement {
             local_name!("script"),
             None,
             &document,
+            None,
             ElementCreator::ScriptCreated,
         );
         let mut media_controls_script = resources::read_string(EmbedderResource::MediaControlsJS);
@@ -1895,6 +1905,7 @@ impl HTMLMediaElement {
             local_name!("script"),
             None,
             &document,
+            None,
             ElementCreator::ScriptCreated,
         );
         style
@@ -2116,7 +2127,7 @@ impl HTMLMediaElementMethods for HTMLMediaElement {
 
     // https://html.spec.whatwg.org/multipage/#dom-media-play
     fn Play(&self, comp: InRealm) -> Rc<Promise> {
-        let promise = Promise::new_in_current_realm(&self.global(), comp);
+        let promise = Promise::new_in_current_realm(comp);
         // Step 1.
         // FIXME(nox): Reject promise if not allowed to play.
 
@@ -2472,6 +2483,7 @@ pub enum MediaElementMicrotask {
     ResourceSelectionTask {
         elem: DomRoot<HTMLMediaElement>,
         generation_id: u32,
+        #[no_trace]
         base_url: ServoUrl,
     },
     PauseIfNotInDocumentTask {
@@ -2508,6 +2520,14 @@ impl MicrotaskRunnable for MediaElementMicrotask {
                     elem.seek_end();
                 }
             },
+        }
+    }
+
+    fn enter_realm(&self) -> JSAutoRealm {
+        match self {
+            &MediaElementMicrotask::ResourceSelectionTask { ref elem, .. } |
+            &MediaElementMicrotask::PauseIfNotInDocumentTask { ref elem } |
+            &MediaElementMicrotask::SeekedTask { ref elem, .. } => enter_realm(&**elem),
         }
     }
 }

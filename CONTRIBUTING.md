@@ -25,7 +25,7 @@ so we can correct that!
 See [`HACKING_QUICKSTART.md`](docs/HACKING_QUICKSTART.md) for more information
 on how to start working on Servo.
 
-## Pull Request Checklist
+## Pull request checklist
 
 - Branch from the master branch and, if needed, rebase to the current master
   branch before submitting your pull request. If it doesn't merge cleanly with
@@ -37,7 +37,7 @@ on how to start working on Servo.
 - Commits should be accompanied by a Developer Certificate of Origin
   (http://developercertificate.org) sign-off, which indicates that you (and
   your employer if applicable) agree to be bound by the terms of the
-  [project license](LICENSE.md). In git, this is the `-s` option to `git commit`
+  [project license](LICENSE). In git, this is the `-s` option to `git commit`.
 
 - If your patch is not getting reviewed or you need a specific person to review
   it, you can @-reply a reviewer asking for a review in the pull request or a
@@ -49,10 +49,23 @@ on how to start working on Servo.
 
 For specific git instructions, see [GitHub workflow 101](https://github.com/servo/servo/wiki/Github-workflow).
 
+## Running tests in pull requests
+
+When you push to a pull request, GitHub automatically checks that your changes have no compilation, lint, or tidy errors.
+
+To run unit tests or Web Platform Tests against a pull request, add one or more of the labels below to your pull request. If you do not have permission to add labels to your pull request, add a comment on your bug requesting that they be added.
+
+| Label | Effect |
+|---|---|
+| `T-full` | Unit tests: Linux, macOS, Windows<br>Layout tests: Linux, macOS<br>Legacy layout tests: Linux, macOS |
+| `T-linux-wpt-2013` | Unit tests: Linux<br>Legacy layout tests: Linux |
+| `T-linux-wpt-2020` | Unit tests: Linux<br>Layout tests: Linux |
+| `T-macos` | Unit tests: macOS |
+| `T-windows` | Unit tests: Windows |
+
 ## Conduct
 
-In all Servo-related forums, we follow the [Rust Code of Conduct](https://www.rust-lang.org/policies/code-of-conduct). For escalation or moderation issues, please contact a member of the Servo Technical Steering Committee instead of the Rust moderation team.
-
+Servo Code of Conduct is published at <https://servo.org/coc/>.
 
 ## Communication
 
@@ -60,25 +73,6 @@ Servo contributors frequent the [Servo Zulip chat](https://servo.zulipchat.com/)
 
 ## Technical Steering Committee
 
-Technical oversight of the Servo Project is provided by the Technical Steering Committee,
-comprised of:
+Technical oversight of the Servo Project is provided by the
+[Technical Steering Committee](https://github.com/servo/project/blob/master/governance/tsc/README.md).
 
-- [Alan Jeffrey](https://github.com/asajeffrey)
-- [Anthony Ramine](https://github.com/nox)
-- [Connor Brewster](https://github.com/cbrewster)
-- [Cheng-You Bai](https://github.com/cybai)
-- [Diane Hosfelt](https://github.com/avadacatavra)
-- [Dzmitry Malyshau](https://github.com/kvark)
-- [Emilio Cobos Álvarez](https://github.com/emilio)
-- [Fernando Jiménez Moreno](https://github.com/ferjm)
-- [Gregory Terzian](https://github.com/gterzian)
-- [Jack Moffitt](https://github.com/metajack)
-- [James Graham](https://github.com/jgraham)
-- [Josh Matthews](https://github.com/jdm)
-- [Keith Yeung](https://github.com/KiChjang)
-- [Lars Bergstrom](https://github.com/larsbergstrom)
-- [Manish Goregaokar](https://github.com/Manishearth)
-- [Martin Robinson](https://github.com/mrobinson)
-- [Patrick Walton](https://github.com/pcwalton)
-- [Paul Rouget](https://github.com/paulrouget)
-- [Simon Sapin](https://github.com/SimonSapin)

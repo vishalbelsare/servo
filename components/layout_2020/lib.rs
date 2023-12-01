@@ -3,40 +3,34 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 #![deny(unsafe_code)]
-
-#[macro_use]
-extern crate log;
-#[macro_use]
-extern crate serde;
+#![feature(once_cell)]
 
 mod cell;
 pub mod context;
-pub mod data;
 pub mod display_list;
+pub mod dom;
 mod dom_traversal;
-pub mod element_data;
 mod flexbox;
 pub mod flow;
 mod formatting_contexts;
-mod fragments;
+mod fragment_tree;
 pub mod geom;
 #[macro_use]
 pub mod layout_debug;
 mod lists;
-mod opaque_node;
 mod positioned;
 pub mod query;
 mod replaced;
 mod sizing;
 mod style_ext;
 pub mod traversal;
-pub mod wrapper;
 
-pub use flow::{BoxTree, FragmentTree};
-
-use crate::geom::flow_relative::Vec2;
+pub use flow::BoxTree;
+pub use fragment_tree::FragmentTree;
 use style::properties::ComputedValues;
 use style::values::computed::{Length, LengthOrAuto};
+
+use crate::geom::LogicalVec2;
 
 pub struct ContainingBlock<'a> {
     inline_size: Length,
@@ -45,7 +39,7 @@ pub struct ContainingBlock<'a> {
 }
 
 struct DefiniteContainingBlock<'a> {
-    size: Vec2<Length>,
+    size: LogicalVec2<Length>,
     style: &'a ComputedValues,
 }
 

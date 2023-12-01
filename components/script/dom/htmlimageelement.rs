@@ -2,15 +2,59 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+use std::cell::Cell;
+use std::collections::HashSet;
+use std::default::Default;
+use std::sync::{Arc, Mutex};
+use std::{char, i32, mem};
+
+use app_units::{Au, AU_PER_PX};
+use cssparser::{Parser, ParserInput};
+use dom_struct::dom_struct;
+use euclid::Point2D;
+use html5ever::{local_name, namespace_url, ns, LocalName, Prefix, QualName};
+use ipc_channel::ipc;
+use ipc_channel::ipc::IpcSender;
+use ipc_channel::router::ROUTER;
+use js::jsapi::JSAutoRealm;
+use js::rust::HandleObject;
+use mime::{self, Mime};
+use msg::constellation_msg::PipelineId;
+use net_traits::image::base::{Image, ImageMetadata};
+use net_traits::image_cache::{
+    CorsStatus, ImageCache, ImageCacheResult, ImageOrMetadataAvailable, ImageResponse,
+    PendingImageId, PendingImageResponse, UsePlaceholder,
+};
+use net_traits::request::{CorsSettings, Destination, Initiator, Referrer, RequestBuilder};
+use net_traits::{
+    FetchMetadata, FetchResponseListener, FetchResponseMsg, NetworkError, ReferrerPolicy,
+    ResourceFetchTiming, ResourceTimingType,
+};
+use num_traits::ToPrimitive;
+use servo_url::origin::{ImmutableOrigin, MutableOrigin};
+use servo_url::ServoUrl;
+use style::attr::{
+    parse_double, parse_length, parse_unsigned_integer, AttrValue, LengthOrPercentageOrAuto,
+};
+use style::context::QuirksMode;
+use style::media_queries::MediaList;
+use style::parser::ParserContext;
+use style::str::is_ascii_digit;
+use style::stylesheets::{CssRuleType, Origin};
+use style::values::specified::length::{Length, NoCalcLength};
+use style::values::specified::source_size_list::SourceSizeList;
+use style::values::specified::AbsoluteLength;
+use style_traits::ParsingMode;
+
 use crate::document_loader::{LoadBlocker, LoadType};
 use crate::dom::activation::Activatable;
 use crate::dom::attr::Attr;
 use crate::dom::bindings::cell::{DomRefCell, RefMut};
-use crate::dom::bindings::codegen::Bindings::DOMRectBinding::DOMRectBinding::DOMRectMethods;
-use crate::dom::bindings::codegen::Bindings::ElementBinding::ElementBinding::ElementMethods;
+use crate::dom::bindings::codegen::Bindings::DOMRectBinding::DOMRect_Binding::DOMRectMethods;
+use crate::dom::bindings::codegen::Bindings::ElementBinding::Element_Binding::ElementMethods;
 use crate::dom::bindings::codegen::Bindings::HTMLImageElementBinding::HTMLImageElementMethods;
 use crate::dom::bindings::codegen::Bindings::MouseEventBinding::MouseEventMethods;
-use crate::dom::bindings::codegen::Bindings::NodeBinding::NodeBinding::NodeMethods;
+use crate::dom::bindings::codegen::Bindings::NodeBinding::Node_Binding::NodeMethods;
 use crate::dom::bindings::codegen::Bindings::WindowBinding::WindowMethods;
 use crate::dom::bindings::error::{Error, Fallible};
 use crate::dom::bindings::inheritance::Castable;
@@ -19,10 +63,10 @@ use crate::dom::bindings::reflector::DomObject;
 use crate::dom::bindings::root::{DomRoot, LayoutDom, MutNullableDom};
 use crate::dom::bindings::str::{DOMString, USVString};
 use crate::dom::document::{determine_policy_for_token, Document};
-use crate::dom::element::{cors_setting_for_element, referrer_policy_for_element};
-use crate::dom::element::{reflect_cross_origin_attribute, set_cross_origin_attribute};
 use crate::dom::element::{
-    AttributeMutation, CustomElementCreationMode, Element, ElementCreator, LayoutElementHelpers,
+    cors_setting_for_element, referrer_policy_for_element, reflect_cross_origin_attribute,
+    set_cross_origin_attribute, AttributeMutation, CustomElementCreationMode, Element,
+    ElementCreator, LayoutElementHelpers,
 };
 use crate::dom::event::Event;
 use crate::dom::eventtarget::EventTarget;
@@ -34,9 +78,9 @@ use crate::dom::htmlmapelement::HTMLMapElement;
 use crate::dom::htmlpictureelement::HTMLPictureElement;
 use crate::dom::htmlsourceelement::HTMLSourceElement;
 use crate::dom::mouseevent::MouseEvent;
-use crate::dom::node::UnbindContext;
 use crate::dom::node::{
     document_from_node, window_from_node, BindContext, Node, NodeDamage, ShadowIncluding,
+    UnbindContext,
 };
 use crate::dom::performanceresourcetiming::InitiatorType;
 use crate::dom::values::UNSIGNED_LONG_MAX;
@@ -46,48 +90,9 @@ use crate::fetch::create_a_potential_cors_request;
 use crate::image_listener::{generate_cache_listener_for_element, ImageCacheListener};
 use crate::microtask::{Microtask, MicrotaskRunnable};
 use crate::network_listener::{self, NetworkListener, PreInvoke, ResourceTimingListener};
+use crate::realms::enter_realm;
 use crate::script_thread::ScriptThread;
 use crate::task_source::TaskSource;
-use app_units::{Au, AU_PER_PX};
-use cssparser::{Parser, ParserInput};
-use dom_struct::dom_struct;
-use euclid::Point2D;
-use html5ever::{LocalName, Prefix, QualName};
-use ipc_channel::ipc;
-use ipc_channel::ipc::IpcSender;
-use ipc_channel::router::ROUTER;
-use mime::{self, Mime};
-use msg::constellation_msg::PipelineId;
-use net_traits::image::base::{Image, ImageMetadata};
-use net_traits::image_cache::{
-    CorsStatus, ImageCache, ImageCacheResult, ImageOrMetadataAvailable, ImageResponse,
-    PendingImageId, PendingImageResponse, UsePlaceholder,
-};
-use net_traits::request::{CorsSettings, Destination, Initiator, Referrer, RequestBuilder};
-use net_traits::{FetchMetadata, FetchResponseListener, FetchResponseMsg, NetworkError};
-use net_traits::{ReferrerPolicy, ResourceFetchTiming, ResourceTimingType};
-use num_traits::ToPrimitive;
-use servo_url::origin::ImmutableOrigin;
-use servo_url::origin::MutableOrigin;
-use servo_url::ServoUrl;
-use std::cell::Cell;
-use std::char;
-use std::collections::HashSet;
-use std::default::Default;
-use std::i32;
-use std::mem;
-use std::sync::{Arc, Mutex};
-use style::attr::{
-    parse_double, parse_length, parse_unsigned_integer, AttrValue, LengthOrPercentageOrAuto,
-};
-use style::context::QuirksMode;
-use style::media_queries::MediaList;
-use style::parser::ParserContext;
-use style::str::is_ascii_digit;
-use style::stylesheets::{CssRuleType, Origin};
-use style::values::specified::length::{Length, NoCalcLength};
-use style::values::specified::{source_size_list::SourceSizeList, AbsoluteLength};
-use style_traits::ParsingMode;
 
 enum ParseState {
     InDescriptor,
@@ -136,15 +141,19 @@ enum ImageRequestPhase {
     Current,
 }
 #[derive(JSTraceable, MallocSizeOf)]
-#[unrooted_must_root_lint::must_root]
+#[crown::unrooted_must_root_lint::must_root]
 struct ImageRequest {
     state: State,
+    #[no_trace]
     parsed_url: Option<ServoUrl>,
     source_url: Option<USVString>,
     blocker: Option<LoadBlocker>,
     #[ignore_malloc_size_of = "Arc"]
+    #[no_trace]
     image: Option<Arc<Image>>,
+    #[no_trace]
     metadata: Option<ImageMetadata>,
+    #[no_trace]
     final_url: Option<ServoUrl>,
     current_pixel_density: Option<f64>,
 }
@@ -681,6 +690,7 @@ impl HTMLImageElement {
             Some(CssRuleType::Style),
             ParsingMode::all(),
             quirks_mode,
+            /* namespaces = */ Default::default(),
             None,
             None,
         );
@@ -1239,22 +1249,25 @@ impl HTMLImageElement {
         }
     }
 
-    #[allow(unrooted_must_root)]
+    #[allow(crown::unrooted_must_root)]
     pub fn new(
         local_name: LocalName,
         prefix: Option<Prefix>,
         document: &Document,
+        proto: Option<HandleObject>,
     ) -> DomRoot<HTMLImageElement> {
-        Node::reflect_node(
+        Node::reflect_node_with_proto(
             Box::new(HTMLImageElement::new_inherited(
                 local_name, prefix, document,
             )),
             document,
+            proto,
         )
     }
 
     pub fn Image(
         window: &Window,
+        proto: Option<HandleObject>,
         width: Option<u32>,
         height: Option<u32>,
     ) -> Fallible<DomRoot<HTMLImageElement>> {
@@ -1264,6 +1277,7 @@ impl HTMLImageElement {
             &window.Document(),
             ElementCreator::ScriptCreated,
             CustomElementCreationMode::Synchronous,
+            proto,
         );
 
         let image = DomRoot::downcast::<HTMLImageElement>(element).unwrap();
@@ -1353,6 +1367,13 @@ impl MicrotaskRunnable for ImageElementMicrotask {
             },
         }
     }
+
+    fn enter_realm(&self) -> JSAutoRealm {
+        match self {
+            &ImageElementMicrotask::StableStateUpdateImageDataTask { ref elem, .. } |
+            &ImageElementMicrotask::EnvironmentChangesTask { ref elem, .. } => enter_realm(&**elem),
+        }
+    }
 }
 
 pub trait LayoutHTMLImageElementHelpers {
@@ -1422,6 +1443,7 @@ pub fn parse_a_sizes_attribute(value: DOMString) -> SourceSizeList {
         // browsers do regarding quirks-mode in a media list?
         ParsingMode::empty(),
         QuirksMode::NoQuirks,
+        /* namespaces = */ Default::default(),
         None,
         None,
     );

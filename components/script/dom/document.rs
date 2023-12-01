@@ -2,6 +2,75 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+use std::borrow::Cow;
+use std::cell::Cell;
+use std::cmp::Ordering;
+use std::collections::hash_map::Entry::{Occupied, Vacant};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::default::Default;
+use std::mem;
+use std::ptr::NonNull;
+use std::rc::Rc;
+use std::slice::from_ref;
+use std::time::{Duration, Instant};
+
+use canvas_traits::webgl::{self, WebGLContextId, WebGLMsg};
+use content_security_policy::{self as csp, CspList};
+use cookie::Cookie;
+use cssparser::match_ignore_ascii_case;
+use devtools_traits::ScriptToDevtoolsControlMsg;
+use dom_struct::dom_struct;
+use embedder_traits::EmbedderMsg;
+use encoding_rs::{Encoding, UTF_8};
+use euclid::default::{Point2D, Rect, Size2D};
+use html5ever::{local_name, namespace_url, ns, LocalName, Namespace, QualName};
+use hyper_serde::Serde;
+use ipc_channel::ipc::{self, IpcSender};
+use js::jsapi::JSObject;
+use js::rust::HandleObject;
+use keyboard_types::{Code, Key, KeyState};
+use lazy_static::lazy_static;
+use metrics::{
+    InteractiveFlag, InteractiveMetrics, InteractiveWindow, ProfilerMetadataFactory,
+    ProgressiveWebMetric,
+};
+use mime::{self, Mime};
+use msg::constellation_msg::BrowsingContextId;
+use net_traits::pub_domains::is_pub_domain;
+use net_traits::request::RequestBuilder;
+use net_traits::response::HttpsState;
+use net_traits::CookieSource::NonHTTP;
+use net_traits::CoreResourceMsg::{GetCookiesForUrl, SetCookiesForUrl};
+use net_traits::{FetchResponseMsg, IpcSend, ReferrerPolicy};
+use num_traits::ToPrimitive;
+use percent_encoding::percent_decode;
+use profile_traits::ipc as profile_ipc;
+use profile_traits::time::{TimerMetadata, TimerMetadataFrameType, TimerMetadataReflowType};
+use script_layout_interface::message::{Msg, PendingRestyle, ReflowGoal};
+use script_layout_interface::TrustedNodeAddress;
+use script_traits::{
+    AnimationState, DocumentActivity, MouseButton, MouseEventType, MsDuration, ScriptMsg,
+    TouchEventType, TouchId, UntrustedNodeAddress, WheelDelta,
+};
+use servo_arc::Arc;
+use servo_atoms::Atom;
+use servo_config::pref;
+use servo_media::{ClientContextId, ServoMedia};
+use servo_url::{ImmutableOrigin, MutableOrigin, ServoUrl};
+use style::attr::AttrValue;
+use style::context::QuirksMode;
+use style::invalidation::element::restyle_hints::RestyleHint;
+use style::media_queries::{Device, MediaType};
+use style::selector_parser::Snapshot;
+use style::shared_lock::SharedRwLock as StyleSharedRwLock;
+use style::str::{split_html_space_chars, str_join};
+use style::stylesheet_set::DocumentStylesheetSet;
+use style::stylesheets::{Origin, OriginSet, Stylesheet};
+use url::Host;
+use uuid::Uuid;
+use webrender_api::units::DeviceIntRect;
+
+use super::bindings::trace::{HashMapTracedValues, NoTrace};
 use crate::animation_timeline::AnimationTimeline;
 use crate::animations::Animations;
 use crate::document_loader::{DocumentLoader, LoadType};
@@ -9,15 +78,15 @@ use crate::dom::attr::Attr;
 use crate::dom::beforeunloadevent::BeforeUnloadEvent;
 use crate::dom::bindings::callback::ExceptionHandling;
 use crate::dom::bindings::cell::{ref_filter_map, DomRefCell, Ref, RefMut};
-use crate::dom::bindings::codegen::Bindings::BeforeUnloadEventBinding::BeforeUnloadEventBinding::BeforeUnloadEventMethods;
+use crate::dom::bindings::codegen::Bindings::BeforeUnloadEventBinding::BeforeUnloadEvent_Binding::BeforeUnloadEventMethods;
 use crate::dom::bindings::codegen::Bindings::DocumentBinding::{
     DocumentMethods, DocumentReadyState,
 };
-use crate::dom::bindings::codegen::Bindings::EventBinding::EventBinding::EventMethods;
-use crate::dom::bindings::codegen::Bindings::HTMLIFrameElementBinding::HTMLIFrameElementBinding::HTMLIFrameElementMethods;
+use crate::dom::bindings::codegen::Bindings::EventBinding::Event_Binding::EventMethods;
+use crate::dom::bindings::codegen::Bindings::HTMLIFrameElementBinding::HTMLIFrameElement_Binding::HTMLIFrameElementMethods;
 use crate::dom::bindings::codegen::Bindings::HTMLInputElementBinding::HTMLInputElementMethods;
 use crate::dom::bindings::codegen::Bindings::HTMLTextAreaElementBinding::HTMLTextAreaElementMethods;
-use crate::dom::bindings::codegen::Bindings::NavigatorBinding::NavigatorBinding::NavigatorMethods;
+use crate::dom::bindings::codegen::Bindings::NavigatorBinding::Navigator_Binding::NavigatorMethods;
 use crate::dom::bindings::codegen::Bindings::NodeBinding::NodeMethods;
 use crate::dom::bindings::codegen::Bindings::NodeFilterBinding::NodeFilter;
 use crate::dom::bindings::codegen::Bindings::PerformanceBinding::PerformanceMethods;
@@ -31,7 +100,7 @@ use crate::dom::bindings::error::{Error, ErrorResult, Fallible};
 use crate::dom::bindings::inheritance::{Castable, ElementTypeId, HTMLElementTypeId, NodeTypeId};
 use crate::dom::bindings::num::Finite;
 use crate::dom::bindings::refcounted::{Trusted, TrustedPromise};
-use crate::dom::bindings::reflector::{reflect_dom_object, DomObject};
+use crate::dom::bindings::reflector::{reflect_dom_object_with_proto, DomObject};
 use crate::dom::bindings::root::{Dom, DomRoot, DomSlice, LayoutDom, MutNullableDom};
 use crate::dom::bindings::str::{DOMString, USVString};
 use crate::dom::bindings::xmlname::XMLName::InvalidXMLName;
@@ -48,9 +117,9 @@ use crate::dom::documentfragment::DocumentFragment;
 use crate::dom::documentorshadowroot::{DocumentOrShadowRoot, StyleSheetInDocument};
 use crate::dom::documenttype::DocumentType;
 use crate::dom::domimplementation::DOMImplementation;
-use crate::dom::element::CustomElementCreationMode;
 use crate::dom::element::{
-    Element, ElementCreator, ElementPerformFullscreenEnter, ElementPerformFullscreenExit,
+    CustomElementCreationMode, Element, ElementCreator, ElementPerformFullscreenEnter,
+    ElementPerformFullscreenExit,
 };
 use crate::dom::event::{Event, EventBubbles, EventCancelable, EventDefault, EventStatus};
 use crate::dom::eventtarget::EventTarget;
@@ -78,8 +147,10 @@ use crate::dom::keyboardevent::KeyboardEvent;
 use crate::dom::location::Location;
 use crate::dom::messageevent::MessageEvent;
 use crate::dom::mouseevent::MouseEvent;
-use crate::dom::node::{self, document_from_node, window_from_node, CloneChildrenFlag};
-use crate::dom::node::{Node, NodeDamage, NodeFlags, ShadowIncluding};
+use crate::dom::node::{
+    self, document_from_node, window_from_node, CloneChildrenFlag, Node, NodeDamage, NodeFlags,
+    ShadowIncluding,
+};
 use crate::dom::nodeiterator::NodeIterator;
 use crate::dom::nodelist::NodeList;
 use crate::dom::pagetransitionevent::PageTransitionEvent;
@@ -104,76 +175,12 @@ use crate::dom::window::{ReflowReason, Window};
 use crate::dom::windowproxy::WindowProxy;
 use crate::fetch::FetchCanceller;
 use crate::realms::{AlreadyInRealm, InRealm};
-use crate::script_runtime::JSContext;
-use crate::script_runtime::{CommonScriptMsg, ScriptThreadEventCategory};
+use crate::script_runtime::{CommonScriptMsg, JSContext, ScriptThreadEventCategory};
 use crate::script_thread::{MainThreadScriptMsg, ScriptThread};
 use crate::stylesheet_set::StylesheetSetRef;
 use crate::task::TaskBox;
 use crate::task_source::{TaskSource, TaskSourceName};
 use crate::timers::OneshotTimerCallback;
-use canvas_traits::webgl::{self, WebGLContextId, WebGLMsg};
-use content_security_policy::{self as csp, CspList};
-use cookie::Cookie;
-use devtools_traits::ScriptToDevtoolsControlMsg;
-use dom_struct::dom_struct;
-use embedder_traits::EmbedderMsg;
-use encoding_rs::{Encoding, UTF_8};
-use euclid::default::{Point2D, Rect, Size2D};
-use html5ever::{LocalName, Namespace, QualName};
-use hyper_serde::Serde;
-use ipc_channel::ipc::{self, IpcSender};
-use js::jsapi::JSObject;
-use keyboard_types::{Code, Key, KeyState};
-use metrics::{
-    InteractiveFlag, InteractiveMetrics, InteractiveWindow, ProfilerMetadataFactory,
-    ProgressiveWebMetric,
-};
-use mime::{self, Mime};
-use msg::constellation_msg::BrowsingContextId;
-use net_traits::pub_domains::is_pub_domain;
-use net_traits::request::RequestBuilder;
-use net_traits::response::HttpsState;
-use net_traits::CookieSource::NonHTTP;
-use net_traits::CoreResourceMsg::{GetCookiesForUrl, SetCookiesForUrl};
-use net_traits::{FetchResponseMsg, IpcSend, ReferrerPolicy};
-use num_traits::ToPrimitive;
-use percent_encoding::percent_decode;
-use profile_traits::ipc as profile_ipc;
-use profile_traits::time::{TimerMetadata, TimerMetadataFrameType, TimerMetadataReflowType};
-use script_layout_interface::message::{Msg, PendingRestyle, ReflowGoal};
-use script_layout_interface::TrustedNodeAddress;
-use script_traits::{AnimationState, DocumentActivity, MouseButton, MouseEventType};
-use script_traits::{
-    MsDuration, ScriptMsg, TouchEventType, TouchId, UntrustedNodeAddress, WheelDelta,
-};
-use servo_arc::Arc;
-use servo_atoms::Atom;
-use servo_config::pref;
-use servo_media::{ClientContextId, ServoMedia};
-use servo_url::{ImmutableOrigin, MutableOrigin, ServoUrl};
-use std::borrow::Cow;
-use std::cell::Cell;
-use std::cmp::Ordering;
-use std::collections::hash_map::Entry::{Occupied, Vacant};
-use std::collections::{HashMap, HashSet, VecDeque};
-use std::default::Default;
-use std::mem;
-use std::ptr::NonNull;
-use std::rc::Rc;
-use std::slice::from_ref;
-use std::time::{Duration, Instant};
-use style::attr::AttrValue;
-use style::context::QuirksMode;
-use style::invalidation::element::restyle_hints::RestyleHint;
-use style::media_queries::{Device, MediaType};
-use style::selector_parser::Snapshot;
-use style::shared_lock::SharedRwLock as StyleSharedRwLock;
-use style::str::{split_html_space_chars, str_join};
-use style::stylesheet_set::DocumentStylesheetSet;
-use style::stylesheets::{Origin, OriginSet, Stylesheet};
-use url::Host;
-use uuid::Uuid;
-use webrender_api::units::DeviceIntRect;
 
 /// The number of times we are allowed to see spurious `requestAnimationFrame()` calls before
 /// falling back to fake ones.
@@ -217,7 +224,7 @@ pub enum IsHTMLDocument {
 }
 
 #[derive(JSTraceable, MallocSizeOf)]
-#[unrooted_must_root_lint::must_root]
+#[crown::unrooted_must_root_lint::must_root]
 enum FocusTransaction {
     /// No focus operation is in effect.
     NotInTransaction,
@@ -234,21 +241,26 @@ pub struct Document {
     window: Dom<Window>,
     implementation: MutNullableDom<DOMImplementation>,
     #[ignore_malloc_size_of = "type from external crate"]
+    #[no_trace]
     content_type: Mime,
     last_modified: Option<String>,
+    #[no_trace]
     encoding: Cell<&'static Encoding>,
     has_browsing_context: bool,
     is_html_document: bool,
+    #[no_trace]
     activity: Cell<DocumentActivity>,
+    #[no_trace]
     url: DomRefCell<ServoUrl>,
     #[ignore_malloc_size_of = "defined in selectors"]
+    #[no_trace]
     quirks_mode: Cell<QuirksMode>,
     /// Caches for the getElement methods
-    id_map: DomRefCell<HashMap<Atom, Vec<Dom<Element>>>>,
-    name_map: DomRefCell<HashMap<Atom, Vec<Dom<Element>>>>,
-    tag_map: DomRefCell<HashMap<LocalName, Dom<HTMLCollection>>>,
-    tagns_map: DomRefCell<HashMap<QualName, Dom<HTMLCollection>>>,
-    classes_map: DomRefCell<HashMap<Vec<Atom>, Dom<HTMLCollection>>>,
+    id_map: DomRefCell<HashMapTracedValues<Atom, Vec<Dom<Element>>>>,
+    name_map: DomRefCell<HashMapTracedValues<Atom, Vec<Dom<Element>>>>,
+    tag_map: DomRefCell<HashMapTracedValues<LocalName, Dom<HTMLCollection>>>,
+    tagns_map: DomRefCell<HashMapTracedValues<QualName, Dom<HTMLCollection>>>,
+    classes_map: DomRefCell<HashMapTracedValues<Vec<Atom>, Dom<HTMLCollection>>>,
     images: MutNullableDom<HTMLCollection>,
     embeds: MutNullableDom<HTMLCollection>,
     links: MutNullableDom<HTMLCollection>,
@@ -258,8 +270,10 @@ pub struct Document {
     applets: MutNullableDom<HTMLCollection>,
     /// Lock use for style attributes and author-origin stylesheet objects in this document.
     /// Can be acquired once for accessing many objects.
+    #[no_trace]
     style_shared_lock: StyleSharedRwLock,
     /// List of stylesheets associated with nodes in this document. |None| if the list needs to be refreshed.
+    #[custom_trace]
     stylesheets: DomRefCell<DocumentStylesheetSet<StyleSheetInDocument>>,
     stylesheet_list: MutNullableDom<StyleSheetList>,
     ready_state: Cell<DocumentReadyState>,
@@ -308,7 +322,7 @@ pub struct Document {
     appropriate_template_contents_owner_document: MutNullableDom<Document>,
     /// Information on elements needing restyle to ship over to the layout thread when the
     /// time comes.
-    pending_restyles: DomRefCell<HashMap<Dom<Element>, PendingRestyle>>,
+    pending_restyles: DomRefCell<HashMap<Dom<Element>, NoTrace<PendingRestyle>>>,
     /// This flag will be true if layout suppressed a reflow attempt that was
     /// needed in order for the page to be painted.
     needs_paint: Cell<bool>,
@@ -327,10 +341,13 @@ pub struct Document {
     unload_event_start: Cell<u64>,
     unload_event_end: Cell<u64>,
     /// <https://html.spec.whatwg.org/multipage/#concept-document-https-state>
+    #[no_trace]
     https_state: Cell<HttpsState>,
     /// The document's origin.
+    #[no_trace]
     origin: MutableOrigin,
     ///  https://w3c.github.io/webappsec-referrer-policy/#referrer-policy-states
+    #[no_trace]
     referrer_policy: Cell<Option<ReferrerPolicy>>,
     /// <https://html.spec.whatwg.org/multipage/#dom-document-referrer>
     referrer: Option<String>,
@@ -338,6 +355,7 @@ pub struct Document {
     target_element: MutNullableDom<Element>,
     /// <https://w3c.github.io/uievents/#event-type-dblclick>
     #[ignore_malloc_size_of = "Defined in std"]
+    #[no_trace]
     last_click_info: DomRefCell<Option<(Instant, Point2D<f32>)>>,
     /// <https://html.spec.whatwg.org/multipage/#ignore-destructive-writes-counter>
     ignore_destructive_writes_counter: Cell<u32>,
@@ -361,8 +379,10 @@ pub struct Document {
     /// whenever any element with the same ID as the form attribute
     /// is inserted or removed from the document.
     /// See https://html.spec.whatwg.org/multipage/#form-owner
-    form_id_listener_map: DomRefCell<HashMap<Atom, HashSet<Dom<Element>>>>,
+    form_id_listener_map: DomRefCell<HashMapTracedValues<Atom, HashSet<Dom<Element>>>>,
+    #[no_trace]
     interactive_time: DomRefCell<InteractiveMetrics>,
+    #[no_trace]
     tti_window: DomRefCell<InteractiveWindow>,
     /// RAII canceller for Fetch
     canceller: FetchCanceller,
@@ -398,11 +418,13 @@ pub struct Document {
     /// hosting the media controls UI.
     media_controls: DomRefCell<HashMap<String, Dom<ShadowRoot>>>,
     /// List of all WebGL context IDs that need flushing.
-    dirty_webgl_contexts: DomRefCell<HashMap<WebGLContextId, Dom<WebGLRenderingContext>>>,
+    dirty_webgl_contexts:
+        DomRefCell<HashMapTracedValues<WebGLContextId, Dom<WebGLRenderingContext>>>,
     /// List of all WebGPU context IDs that need flushing.
     dirty_webgpu_contexts: DomRefCell<HashMap<WebGPUContextId, Dom<GPUCanvasContext>>>,
     /// https://html.spec.whatwg.org/multipage/#concept-document-csp-list
     #[ignore_malloc_size_of = "Defined in rust-content-security-policy"]
+    #[no_trace]
     csp_list: DomRefCell<Option<CspList>>,
     /// https://w3c.github.io/slection-api/#dfn-selection
     selection: MutNullableDom<Selection>,
@@ -462,12 +484,6 @@ impl CollectionFilter for AnchorsFilter {
     fn filter(&self, elem: &Element, _root: &Node) -> bool {
         elem.is::<HTMLAnchorElement>() && elem.has_attribute(&local_name!("href"))
     }
-}
-
-enum ElementLookupResult {
-    None,
-    One(DomRoot<Element>),
-    Many,
 }
 
 #[allow(non_snake_case)]
@@ -2132,7 +2148,7 @@ impl Document {
         let event = beforeunload_event.upcast::<Event>();
         event.set_trusted(true);
         let event_target = self.window.upcast::<EventTarget>();
-        let has_listeners = event.has_listeners_for(&event_target, &atom!("beforeunload"));
+        let has_listeners = event_target.has_listeners_for(&atom!("beforeunload"));
         self.window.dispatch_event_with_target_override(&event);
         // TODO: Step 6, decrease the event loop's termination nesting level by 1.
         // Step 7
@@ -2202,7 +2218,7 @@ impl Document {
             );
             event.set_trusted(true);
             let event_target = self.window.upcast::<EventTarget>();
-            let has_listeners = event.has_listeners_for(&event_target, &atom!("unload"));
+            let has_listeners = event_target.has_listeners_for(&atom!("unload"));
             let _ = self.window.dispatch_event_with_target_override(&event);
             self.fired_unload.set(true);
             // Step 9
@@ -2862,7 +2878,7 @@ impl Document {
             .or_insert_with(|| Dom::from_ref(context));
     }
 
-    #[allow(unrooted_must_root)]
+    #[allow(crown::unrooted_must_root)]
     pub fn flush_dirty_webgpu_canvases(&self) {
         self.dirty_webgpu_contexts
             .borrow_mut()
@@ -2870,73 +2886,12 @@ impl Document {
             .for_each(|(_, context)| context.send_swap_chain_present());
     }
 
-    // https://html.spec.whatwg.org/multipage/#dom-tree-accessors:supported-property-names
-    // (This takes the filter as a method so the window named getter can use it too)
-    pub fn supported_property_names_impl(
-        &self,
-        nameditem_filter: fn(&Node, &Atom) -> bool,
-    ) -> Vec<DOMString> {
-        // The tricky part here is making sure we return the names in
-        // tree order, without just resorting to a full tree walkthrough.
+    pub fn id_map(&self) -> Ref<HashMapTracedValues<Atom, Vec<Dom<Element>>>> {
+        self.id_map.borrow()
+    }
 
-        let mut first_elements_with_name: HashMap<&Atom, &Dom<Element>> = HashMap::new();
-
-        // Get the first-in-tree-order element for each name in the name_map
-        let name_map = self.name_map.borrow();
-        name_map.iter().for_each(|(name, value)| {
-            if let Some(first) = value
-                .iter()
-                .find(|n| nameditem_filter((***n).upcast::<Node>(), &name))
-            {
-                first_elements_with_name.insert(name, first);
-            }
-        });
-
-        // Get the first-in-tree-order element for each name in the id_map;
-        // if we already had one from the name_map, figure out which of
-        // the two is first.
-        let id_map = self.id_map.borrow();
-        id_map.iter().for_each(|(name, value)| {
-            if let Some(first) = value
-                .iter()
-                .find(|n| nameditem_filter((***n).upcast::<Node>(), &name))
-            {
-                match first_elements_with_name.get(&name) {
-                    None => {
-                        first_elements_with_name.insert(name, first);
-                    },
-                    Some(el) => {
-                        if *el != first && first.upcast::<Node>().is_before(el.upcast::<Node>()) {
-                            first_elements_with_name.insert(name, first);
-                        }
-                    },
-                }
-            }
-        });
-
-        // first_elements_with_name now has our supported property names
-        // as keys, and the elements to order on as values.
-        let mut sortable_vec: Vec<(&Atom, &Dom<Element>)> = first_elements_with_name
-            .iter()
-            .map(|(k, v)| (*k, *v))
-            .collect();
-        sortable_vec.sort_unstable_by(|a, b| {
-            if a.1 == b.1 {
-                // This can happen if an img has an id different from its name,
-                // spec does not say which string to put first.
-                a.0.cmp(&b.0)
-            } else if a.1.upcast::<Node>().is_before(b.1.upcast::<Node>()) {
-                Ordering::Less
-            } else {
-                Ordering::Greater
-            }
-        });
-
-        // And now that they're sorted, we can return the keys
-        sortable_vec
-            .iter()
-            .map(|(k, _v)| DOMString::from(&***k))
-            .collect()
+    pub fn name_map(&self) -> Ref<HashMapTracedValues<Atom, Vec<Dom<Element>>>> {
+        self.name_map.borrow()
     }
 }
 
@@ -3137,15 +3092,15 @@ impl Document {
             url: DomRefCell::new(url),
             // https://dom.spec.whatwg.org/#concept-document-quirks
             quirks_mode: Cell::new(QuirksMode::NoQuirks),
-            id_map: DomRefCell::new(HashMap::new()),
-            name_map: DomRefCell::new(HashMap::new()),
+            id_map: DomRefCell::new(HashMapTracedValues::new()),
+            name_map: DomRefCell::new(HashMapTracedValues::new()),
             // https://dom.spec.whatwg.org/#concept-document-encoding
             encoding: Cell::new(encoding),
             is_html_document: is_html_document == IsHTMLDocument::HTMLDocument,
             activity: Cell::new(activity),
-            tag_map: DomRefCell::new(HashMap::new()),
-            tagns_map: DomRefCell::new(HashMap::new()),
-            classes_map: DomRefCell::new(HashMap::new()),
+            tag_map: DomRefCell::new(HashMapTracedValues::new()),
+            tagns_map: DomRefCell::new(HashMapTracedValues::new()),
+            classes_map: DomRefCell::new(HashMapTracedValues::new()),
             images: Default::default(),
             embeds: Default::default(),
             links: Default::default(),
@@ -3230,7 +3185,7 @@ impl Document {
             shadow_roots: DomRefCell::new(HashSet::new()),
             shadow_roots_styles_changed: Cell::new(false),
             media_controls: DomRefCell::new(HashMap::new()),
-            dirty_webgl_contexts: DomRefCell::new(HashMap::new()),
+            dirty_webgl_contexts: DomRefCell::new(HashMapTracedValues::new()),
             dirty_webgpu_contexts: DomRefCell::new(HashMap::new()),
             csp_list: DomRefCell::new(None),
             selection: MutNullableDom::new(None),
@@ -3315,11 +3270,15 @@ impl Document {
 
     // https://dom.spec.whatwg.org/#dom-document-document
     #[allow(non_snake_case)]
-    pub fn Constructor(window: &Window) -> Fallible<DomRoot<Document>> {
+    pub fn Constructor(
+        window: &Window,
+        proto: Option<HandleObject>,
+    ) -> Fallible<DomRoot<Document>> {
         let doc = window.Document();
         let docloader = DocumentLoader::new(&*doc.loader());
-        Ok(Document::new(
+        Ok(Document::new_with_proto(
             window,
+            proto,
             HasBrowsingContext::No,
             None,
             doc.origin().clone(),
@@ -3350,7 +3309,41 @@ impl Document {
         referrer_policy: Option<ReferrerPolicy>,
         canceller: FetchCanceller,
     ) -> DomRoot<Document> {
-        let document = reflect_dom_object(
+        Self::new_with_proto(
+            window,
+            None,
+            has_browsing_context,
+            url,
+            origin,
+            doctype,
+            content_type,
+            last_modified,
+            activity,
+            source,
+            doc_loader,
+            referrer,
+            referrer_policy,
+            canceller,
+        )
+    }
+
+    fn new_with_proto(
+        window: &Window,
+        proto: Option<HandleObject>,
+        has_browsing_context: HasBrowsingContext,
+        url: Option<ServoUrl>,
+        origin: MutableOrigin,
+        doctype: IsHTMLDocument,
+        content_type: Option<Mime>,
+        last_modified: Option<String>,
+        activity: DocumentActivity,
+        source: DocumentSource,
+        doc_loader: DocumentLoader,
+        referrer: Option<String>,
+        referrer_policy: Option<ReferrerPolicy>,
+        canceller: FetchCanceller,
+    ) -> DomRoot<Document> {
+        let document = reflect_dom_object_with_proto(
             Box::new(Document::new_inherited(
                 window,
                 has_browsing_context,
@@ -3367,6 +3360,7 @@ impl Document {
                 canceller,
             )),
             window,
+            proto,
         );
         {
             let node = document.upcast::<Node>();
@@ -3521,8 +3515,10 @@ impl Document {
     pub fn ensure_pending_restyle(&self, el: &Element) -> RefMut<PendingRestyle> {
         let map = self.pending_restyles.borrow_mut();
         RefMut::map(map, |m| {
-            m.entry(Dom::from_ref(el))
-                .or_insert_with(PendingRestyle::new)
+            &mut m
+                .entry(Dom::from_ref(el))
+                .or_insert_with(|| NoTrace(PendingRestyle::new()))
+                .0
         })
     }
 
@@ -3640,9 +3636,8 @@ impl Document {
     // https://fullscreen.spec.whatwg.org/#dom-element-requestfullscreen
     pub fn enter_fullscreen(&self, pending: &Element) -> Rc<Promise> {
         // Step 1
-        let in_realm_proof = AlreadyInRealm::assert(&self.global());
-        let promise =
-            Promise::new_in_current_realm(&self.global(), InRealm::Already(&in_realm_proof));
+        let in_realm_proof = AlreadyInRealm::assert();
+        let promise = Promise::new_in_current_realm(InRealm::Already(&in_realm_proof));
         let mut error = false;
 
         // Step 4
@@ -3709,8 +3704,8 @@ impl Document {
     pub fn exit_fullscreen(&self) -> Rc<Promise> {
         let global = self.global();
         // Step 1
-        let in_realm_proof = AlreadyInRealm::assert(&global);
-        let promise = Promise::new_in_current_realm(&global, InRealm::Already(&in_realm_proof));
+        let in_realm_proof = AlreadyInRealm::assert();
+        let promise = Promise::new_in_current_realm(InRealm::Already(&in_realm_proof));
         // Step 2
         if self.fullscreen_element.get().is_none() {
             promise.reject_error(Error::Type(String::from("fullscreen is null")));
@@ -3822,7 +3817,7 @@ impl Document {
 
     /// Add a stylesheet owned by `owner` to the list of document sheets, in the
     /// correct tree position.
-    #[allow(unrooted_must_root)] // Owner needs to be rooted already necessarily.
+    #[allow(crown::unrooted_must_root)] // Owner needs to be rooted already necessarily.
     pub fn add_stylesheet(&self, owner: &Element, sheet: Arc<Stylesheet>) {
         let stylesheets = &mut *self.stylesheets.borrow_mut();
         let insertion_point = stylesheets
@@ -3855,7 +3850,7 @@ impl Document {
     }
 
     /// Remove a stylesheet owned by `owner` from the list of document sheets.
-    #[allow(unrooted_must_root)] // Owner needs to be rooted already necessarily.
+    #[allow(crown::unrooted_must_root)] // Owner needs to be rooted already necessarily.
     pub fn remove_stylesheet(&self, owner: &Element, s: &Arc<Stylesheet>) {
         match self.window.layout_chan() {
             Some(chan) => chan.send(Msg::RemoveStylesheet(s.clone())).unwrap(),
@@ -3869,82 +3864,19 @@ impl Document {
         )
     }
 
-    // https://html.spec.whatwg.org/multipage/#dom-tree-accessors:determine-the-value-of-a-named-property
-    // Support method for steps 1-3:
-    // Count if there are 0, 1, or >1 elements that match the name.
-    // (This takes the filter as a method so the window named getter can use it too)
-    fn look_up_named_elements(
-        &self,
-        name: &Atom,
-        nameditem_filter: fn(&Node, &Atom) -> bool,
-    ) -> ElementLookupResult {
-        // We might match because of either id==name or name==name, so there
-        // are two sets of nodes to look through, but we don't need a
-        // full tree traversal.
-        let id_map = self.id_map.borrow();
-        let name_map = self.name_map.borrow();
-        let id_vec = id_map.get(&name);
-        let name_vec = name_map.get(&name);
-
-        // If nothing can possibly have the name, exit fast
-        if id_vec.is_none() && name_vec.is_none() {
-            return ElementLookupResult::None;
-        }
-
-        let one_from_id_map = if let Some(id_vec) = id_vec {
-            let mut elements = id_vec
-                .iter()
-                .filter(|n| nameditem_filter((***n).upcast::<Node>(), &name))
-                .peekable();
-            if let Some(first) = elements.next() {
-                if elements.peek().is_none() {
-                    Some(first)
-                } else {
-                    return ElementLookupResult::Many;
-                }
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-
-        let one_from_name_map = if let Some(name_vec) = name_vec {
-            let mut elements = name_vec
-                .iter()
-                .filter(|n| nameditem_filter((***n).upcast::<Node>(), &name))
-                .peekable();
-            if let Some(first) = elements.next() {
-                if elements.peek().is_none() {
-                    Some(first)
-                } else {
-                    return ElementLookupResult::Many;
-                }
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-
-        // We now have two elements, or one element, or the same
-        // element twice, or no elements.
-        match (one_from_id_map, one_from_name_map) {
-            (Some(one), None) | (None, Some(one)) => {
-                ElementLookupResult::One(DomRoot::from_ref(&one))
-            },
-            (Some(one), Some(other)) => {
-                if one == other {
-                    ElementLookupResult::One(DomRoot::from_ref(&one))
-                } else {
-                    ElementLookupResult::Many
-                }
-            },
-            (None, None) => ElementLookupResult::None,
-        }
+    pub fn get_elements_with_id(&self, id: &Atom) -> Ref<[Dom<Element>]> {
+        Ref::map(self.id_map.borrow(), |map| {
+            map.get(id).map(|vec| &**vec).unwrap_or_default()
+        })
     }
 
-    #[allow(unrooted_must_root)]
+    pub fn get_elements_with_name(&self, name: &Atom) -> Ref<[Dom<Element>]> {
+        Ref::map(self.name_map.borrow(), |map| {
+            map.get(name).map(|vec| &**vec).unwrap_or_default()
+        })
+    }
+
+    #[allow(crown::unrooted_must_root)]
     pub fn drain_pending_restyles(&self) -> Vec<(TrustedNodeAddress, PendingRestyle)> {
         self.pending_restyles
             .borrow_mut()
@@ -3955,7 +3887,7 @@ impl Document {
                     return None;
                 }
                 node.note_dirty_descendants();
-                Some((node.to_trusted_node_address(), restyle))
+                Some((node.to_trusted_node_address(), restyle.0))
             })
             .collect()
     }
@@ -3982,6 +3914,18 @@ impl Document {
             .update_for_new_timeline_value(&self.window, current_timeline_value);
     }
 
+    pub(crate) fn maybe_mark_animating_nodes_as_dirty(&self) {
+        let current_timeline_value = self.current_animation_timeline_value();
+        let marked_dirty = self
+            .animations
+            .borrow()
+            .mark_animating_nodes_as_dirty(current_timeline_value);
+
+        if marked_dirty {
+            self.window().add_pending_reflow();
+        }
+    }
+
     pub(crate) fn current_animation_timeline_value(&self) -> f64 {
         self.animation_timeline.borrow().current_value()
     }
@@ -4005,13 +3949,21 @@ impl Element {
     fn click_event_filter_by_disabled_state(&self) -> bool {
         let node = self.upcast::<Node>();
         match node.type_id() {
-            NodeTypeId::Element(ElementTypeId::HTMLElement(HTMLElementTypeId::HTMLButtonElement)) |
-            NodeTypeId::Element(ElementTypeId::HTMLElement(HTMLElementTypeId::HTMLInputElement)) |
-            // NodeTypeId::Element(ElementTypeId::HTMLKeygenElement) |
-            NodeTypeId::Element(ElementTypeId::HTMLElement(HTMLElementTypeId::HTMLOptionElement)) |
-            NodeTypeId::Element(ElementTypeId::HTMLElement(HTMLElementTypeId::HTMLSelectElement)) |
-            NodeTypeId::Element(ElementTypeId::HTMLElement(HTMLElementTypeId::HTMLTextAreaElement))
-                if self.disabled_state() => true,
+            NodeTypeId::Element(ElementTypeId::HTMLElement(
+                HTMLElementTypeId::HTMLButtonElement,
+            )) |
+            NodeTypeId::Element(ElementTypeId::HTMLElement(
+                HTMLElementTypeId::HTMLInputElement,
+            )) |
+            NodeTypeId::Element(ElementTypeId::HTMLElement(
+                HTMLElementTypeId::HTMLOptionElement,
+            )) |
+            NodeTypeId::Element(ElementTypeId::HTMLElement(
+                HTMLElementTypeId::HTMLSelectElement,
+            )) |
+            NodeTypeId::Element(ElementTypeId::HTMLElement(
+                HTMLElementTypeId::HTMLTextAreaElement,
+            )) if self.disabled_state() => true,
             _ => false,
         }
     }
@@ -4262,6 +4214,7 @@ impl DocumentMethods for Document {
             self,
             ElementCreator::ScriptCreated,
             CustomElementCreationMode::Synchronous,
+            None,
         ))
     }
 
@@ -4286,6 +4239,7 @@ impl DocumentMethods for Document {
             self,
             ElementCreator::ScriptCreated,
             CustomElementCreationMode::Synchronous,
+            None,
         ))
     }
 
@@ -4360,7 +4314,7 @@ impl DocumentMethods for Document {
 
     // https://dom.spec.whatwg.org/#dom-document-createcomment
     fn CreateComment(&self, data: DOMString) -> DomRoot<Comment> {
-        Comment::new(data, self)
+        Comment::new(data, self, None)
     }
 
     // https://dom.spec.whatwg.org/#dom-document-createprocessinginstruction
@@ -4480,7 +4434,7 @@ impl DocumentMethods for Document {
 
     // https://dom.spec.whatwg.org/#dom-document-createrange
     fn CreateRange(&self) -> DomRoot<Range> {
-        Range::new_with_doc(self)
+        Range::new_with_doc(self, None)
     }
 
     // https://dom.spec.whatwg.org/#dom-document-createnodeiteratorroot-whattoshow-filter
@@ -4553,6 +4507,7 @@ impl DocumentMethods for Document {
                         self,
                         ElementCreator::ScriptCreated,
                         CustomElementCreationMode::Synchronous,
+                        None,
                     );
                     let parent = root.upcast::<Node>();
                     let child = elem.upcast::<Node>();
@@ -4577,6 +4532,7 @@ impl DocumentMethods for Document {
                             self,
                             ElementCreator::ScriptCreated,
                             CustomElementCreationMode::Synchronous,
+                            None,
                         );
                         head.upcast::<Node>().AppendChild(elem.upcast()).unwrap()
                     },
@@ -4871,45 +4827,77 @@ impl DocumentMethods for Document {
     #[allow(unsafe_code)]
     // https://html.spec.whatwg.org/multipage/#dom-tree-accessors:dom-document-nameditem-filter
     fn NamedGetter(&self, _cx: JSContext, name: DOMString) -> Option<NonNull<JSObject>> {
-        #[derive(JSTraceable, MallocSizeOf)]
-        struct NamedElementFilter {
-            name: Atom,
+        if name.is_empty() {
+            return None;
         }
-        impl CollectionFilter for NamedElementFilter {
-            fn filter(&self, elem: &Element, _root: &Node) -> bool {
-                elem.upcast::<Node>().is_document_named_item(&self.name)
+        let name = Atom::from(name);
+
+        // Step 1.
+        let elements_with_name = self.get_elements_with_name(&name);
+        let name_iter = elements_with_name
+            .iter()
+            .filter(|elem| is_named_element_with_name_attribute(elem));
+        let elements_with_id = self.get_elements_with_id(&name);
+        let id_iter = elements_with_id
+            .iter()
+            .filter(|elem| is_named_element_with_id_attribute(elem));
+        let mut elements = name_iter.chain(id_iter);
+
+        let first = elements.next()?;
+
+        if elements.next().is_none() {
+            // Step 2.
+            if let Some(nested_window_proxy) = first
+                .downcast::<HTMLIFrameElement>()
+                .and_then(|iframe| iframe.GetContentWindow())
+            {
+                unsafe {
+                    return Some(NonNull::new_unchecked(
+                        nested_window_proxy.reflector().get_jsobject().get(),
+                    ));
+                }
+            }
+
+            // Step 3.
+            unsafe {
+                return Some(NonNull::new_unchecked(
+                    first.reflector().get_jsobject().get(),
+                ));
             }
         }
 
-        let name = Atom::from(name);
-
-        match self.look_up_named_elements(&name, Node::is_document_named_item) {
-            ElementLookupResult::None => {
-                return None;
-            },
-            ElementLookupResult::One(element) => {
-                if let Some(nested_proxy) = element
-                    .downcast::<HTMLIFrameElement>()
-                    .and_then(|iframe| iframe.GetContentWindow())
-                {
-                    unsafe {
-                        return Some(NonNull::new_unchecked(
-                            nested_proxy.reflector().get_jsobject().get(),
-                        ));
-                    }
-                }
-                unsafe {
-                    return Some(NonNull::new_unchecked(
-                        element.reflector().get_jsobject().get(),
-                    ));
-                }
-            },
-            ElementLookupResult::Many => {},
-        };
-
         // Step 4.
-        let filter = NamedElementFilter { name: name };
-        let collection = HTMLCollection::create(self.window(), self.upcast(), Box::new(filter));
+        #[derive(JSTraceable, MallocSizeOf)]
+        struct DocumentNamedGetter {
+            #[no_trace]
+            name: Atom,
+        }
+        impl CollectionFilter for DocumentNamedGetter {
+            fn filter(&self, elem: &Element, _root: &Node) -> bool {
+                let type_ = match elem.upcast::<Node>().type_id() {
+                    NodeTypeId::Element(ElementTypeId::HTMLElement(type_)) => type_,
+                    _ => return false,
+                };
+                match type_ {
+                    HTMLElementTypeId::HTMLFormElement | HTMLElementTypeId::HTMLIFrameElement => {
+                        elem.get_name().as_ref() == Some(&self.name)
+                    },
+                    HTMLElementTypeId::HTMLImageElement => elem.get_name().map_or(false, |name| {
+                        name == *self.name ||
+                            !name.is_empty() && elem.get_id().as_ref() == Some(&self.name)
+                    }),
+                    // TODO handle <embed> and <object>; these depend on whether the element is
+                    // “exposed”, a concept that doesn’t fully make sense until embed/object
+                    // behaviour is actually implemented
+                    _ => false,
+                }
+            }
+        }
+        let collection = HTMLCollection::create(
+            self.window(),
+            self.upcast(),
+            Box::new(DocumentNamedGetter { name }),
+        );
         unsafe {
             Some(NonNull::new_unchecked(
                 collection.reflector().get_jsobject().get(),
@@ -4919,7 +4907,61 @@ impl DocumentMethods for Document {
 
     // https://html.spec.whatwg.org/multipage/#dom-tree-accessors:supported-property-names
     fn SupportedPropertyNames(&self) -> Vec<DOMString> {
-        self.supported_property_names_impl(Node::is_document_named_item)
+        let mut names_with_first_named_element_map: HashMap<&Atom, &Element> = HashMap::new();
+
+        let name_map = self.name_map.borrow();
+        for (name, elements) in &(*name_map).0 {
+            if name.is_empty() {
+                continue;
+            }
+            let mut name_iter = elements
+                .iter()
+                .filter(|elem| is_named_element_with_name_attribute(elem));
+            if let Some(first) = name_iter.next() {
+                names_with_first_named_element_map.insert(name, first);
+            }
+        }
+        let id_map = self.id_map.borrow();
+        for (id, elements) in &(*id_map).0 {
+            if id.is_empty() {
+                continue;
+            }
+            let mut id_iter = elements
+                .iter()
+                .filter(|elem| is_named_element_with_id_attribute(elem));
+            if let Some(first) = id_iter.next() {
+                match names_with_first_named_element_map.entry(id) {
+                    Vacant(entry) => drop(entry.insert(first)),
+                    Occupied(mut entry) => {
+                        if first.upcast::<Node>().is_before(entry.get().upcast()) {
+                            *entry.get_mut() = first;
+                        }
+                    },
+                }
+            }
+        }
+
+        let mut names_with_first_named_element_vec: Vec<(&Atom, &Element)> =
+            names_with_first_named_element_map
+                .iter()
+                .map(|(k, v)| (*k, *v))
+                .collect();
+        names_with_first_named_element_vec.sort_unstable_by(|a, b| {
+            if a.1 == b.1 {
+                // This can happen if an img has an id different from its name,
+                // spec does not say which string to put first.
+                a.0.cmp(&b.0)
+            } else if a.1.upcast::<Node>().is_before(b.1.upcast::<Node>()) {
+                Ordering::Less
+            } else {
+                Ordering::Greater
+            }
+        });
+
+        names_with_first_named_element_vec
+            .iter()
+            .map(|(k, _v)| DOMString::from(&***k))
+            .collect()
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-document-clear
@@ -5316,7 +5358,7 @@ impl AnimationFrameCallback {
 }
 
 #[derive(Default, JSTraceable, MallocSizeOf)]
-#[unrooted_must_root_lint::must_root]
+#[crown::unrooted_must_root_lint::must_root]
 struct PendingInOrderScriptVec {
     scripts: DomRefCell<VecDeque<PendingScript>>,
 }
@@ -5354,9 +5396,10 @@ impl PendingInOrderScriptVec {
 }
 
 #[derive(JSTraceable, MallocSizeOf)]
-#[unrooted_must_root_lint::must_root]
+#[crown::unrooted_must_root_lint::must_root]
 struct PendingScript {
     element: Dom<HTMLScriptElement>,
+    // TODO(sagudev): could this be all no_trace?
     load: Option<ScriptResult>,
 }
 
@@ -5393,4 +5436,27 @@ pub enum ReflowTriggerCondition {
     DirtyDescendants,
     PendingRestyles,
     PaintPostponed,
+}
+
+fn is_named_element_with_name_attribute(elem: &Element) -> bool {
+    let type_ = match elem.upcast::<Node>().type_id() {
+        NodeTypeId::Element(ElementTypeId::HTMLElement(type_)) => type_,
+        _ => return false,
+    };
+    match type_ {
+        HTMLElementTypeId::HTMLFormElement |
+        HTMLElementTypeId::HTMLIFrameElement |
+        HTMLElementTypeId::HTMLImageElement => true,
+        // TODO handle <embed> and <object>; these depend on whether the element is
+        // “exposed”, a concept that doesn’t fully make sense until embed/object
+        // behaviour is actually implemented
+        _ => false,
+    }
+}
+
+fn is_named_element_with_id_attribute(elem: &Element) -> bool {
+    // TODO handle <embed> and <object>; these depend on whether the element is
+    // “exposed”, a concept that doesn’t fully make sense until embed/object
+    // behaviour is actually implemented
+    elem.is::<HTMLImageElement>() && elem.get_name().map_or(false, |name| !name.is_empty())
 }

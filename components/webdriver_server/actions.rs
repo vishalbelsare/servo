@@ -2,23 +2,23 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-use crate::Handler;
-use compositing::ConstellationMsg;
+use std::collections::HashSet;
+use std::time::{Duration, Instant};
+use std::{cmp, thread};
+
+use compositing_traits::ConstellationMsg;
 use ipc_channel::ipc;
 use keyboard_types::webdriver::KeyInputState;
 use script_traits::webdriver_msg::WebDriverScriptCommand;
 use script_traits::{MouseButton, MouseEventType, WebDriverCommandMsg};
-use std::cmp;
-use std::collections::HashSet;
-use std::thread;
-use std::time::{Duration, Instant};
-use webdriver::actions::{ActionSequence, ActionsType, GeneralAction, NullActionItem};
-use webdriver::actions::{KeyAction, KeyActionItem, KeyDownAction, KeyUpAction};
 use webdriver::actions::{
-    PointerAction, PointerActionItem, PointerActionParameters, PointerDownAction,
+    ActionSequence, ActionsType, GeneralAction, KeyAction, KeyActionItem, KeyDownAction,
+    KeyUpAction, NullActionItem, PointerAction, PointerActionItem, PointerActionParameters,
+    PointerDownAction, PointerMoveAction, PointerOrigin, PointerType, PointerUpAction,
 };
-use webdriver::actions::{PointerMoveAction, PointerOrigin, PointerType, PointerUpAction};
 use webdriver::error::ErrorStatus;
+
+use crate::Handler;
 
 // Interval between pointerMove increments in ms, based on common vsync
 static POINTERMOVE_INTERVAL: u64 = 17;
@@ -77,6 +77,7 @@ fn compute_tick_duration(tick_actions: &ActionSequence) -> u64 {
             }
         },
         ActionsType::Key { actions: _ } => (),
+        ActionsType::Wheel { .. } => todo!("Not implemented."),
     }
     duration
 }
@@ -188,6 +189,7 @@ impl Handler {
                     }
                 }
             },
+            ActionsType::Wheel { .. } => todo!("Not implemented."),
         }
 
         Ok(())
@@ -282,6 +284,7 @@ impl Handler {
                 actions: vec![PointerActionItem::Pointer(PointerAction::Up(
                     PointerUpAction {
                         button: action.button,
+                        ..Default::default()
                     },
                 ))],
             },
@@ -328,6 +331,7 @@ impl Handler {
                 actions: vec![PointerActionItem::Pointer(PointerAction::Down(
                     PointerDownAction {
                         button: action.button,
+                        ..Default::default()
                     },
                 ))],
             },
@@ -356,8 +360,8 @@ impl Handler {
         let tick_start = Instant::now();
 
         // Steps 1 - 2
-        let x_offset = action.x.unwrap_or(0);
-        let y_offset = action.y.unwrap_or(0);
+        let x_offset = action.x;
+        let y_offset = action.y;
 
         // Steps 3 - 4
         let (start_x, start_y) = match self

@@ -4,29 +4,22 @@
 
 //! The `Fragment` type, which represents the leaves of the layout tree.
 
-use crate::context::{with_thread_local_font_context, LayoutContext};
-use crate::display_list::items::{ClipScrollNodeIndex, OpaqueNode, BLUR_INFLATION_FACTOR};
-use crate::display_list::ToLayout;
-use crate::floats::ClearType;
-use crate::flow::{GetBaseFlow, ImmutableFlowUtils};
-use crate::flow_ref::FlowRef;
-use crate::inline::{InlineFragmentContext, InlineFragmentNodeFlags, InlineFragmentNodeInfo};
-use crate::inline::{InlineMetrics, LineMetrics};
-#[cfg(debug_assertions)]
-use crate::layout_debug;
-use crate::model::style_length;
-use crate::model::{self, IntrinsicISizes, IntrinsicISizesContribution, MaybeAuto, SizeConstraint};
-use crate::text;
-use crate::text::TextRunScanner;
-use crate::wrapper::ThreadSafeLayoutNodeHelpers;
-use crate::ServoArc;
+use std::borrow::ToOwned;
+use std::cmp::{max, min, Ordering};
+use std::collections::LinkedList;
+use std::sync::{Arc, Mutex};
+use std::{f32, fmt};
+
 use app_units::Au;
+use bitflags::bitflags;
 use canvas_traits::canvas::{CanvasId, CanvasMsg};
 use euclid::default::{Point2D, Rect, Size2D, Vector2D};
 use gfx::text::glyph::ByteIndex;
 use gfx::text::text_run::{TextRun, TextRunSlice};
 use gfx_traits::StackingContextId;
+use html5ever::{local_name, namespace_url, ns};
 use ipc_channel::ipc::IpcSender;
+use log::debug;
 use msg::constellation_msg::{BrowsingContextId, PipelineId};
 use net_traits::image::base::{Image, ImageMetadata};
 use net_traits::image_cache::{ImageOrMetadataAvailable, UsePlaceholder};
@@ -37,11 +30,7 @@ use script_layout_interface::wrapper_traits::{
 use script_layout_interface::{HTMLCanvasData, HTMLCanvasDataSource, HTMLMediaData, SVGSVGData};
 use serde::ser::{Serialize, SerializeStruct, Serializer};
 use servo_url::ServoUrl;
-use std::borrow::ToOwned;
-use std::cmp::{max, min, Ordering};
-use std::collections::LinkedList;
-use std::sync::{Arc, Mutex};
-use std::{f32, fmt};
+use size_of_test::size_of_test;
 use style::computed_values::border_collapse::T as BorderCollapse;
 use style::computed_values::box_sizing::T as BoxSizing;
 use style::computed_values::clear::T as Clear;
@@ -64,8 +53,27 @@ use style::values::computed::counters::ContentItem;
 use style::values::computed::{Length, Size, VerticalAlign};
 use style::values::generics::box_::{Perspective, VerticalAlignKeyword};
 use style::values::generics::transform;
-use webrender_api;
 use webrender_api::units::LayoutTransform;
+use webrender_api::{self, ImageKey};
+
+use crate::context::{with_thread_local_font_context, LayoutContext};
+use crate::display_list::items::{ClipScrollNodeIndex, OpaqueNode, BLUR_INFLATION_FACTOR};
+use crate::display_list::ToLayout;
+use crate::floats::ClearType;
+use crate::flow::{GetBaseFlow, ImmutableFlowUtils};
+use crate::flow_ref::FlowRef;
+use crate::inline::{
+    InlineFragmentContext, InlineFragmentNodeFlags, InlineFragmentNodeInfo, InlineMetrics,
+    LineMetrics,
+};
+#[cfg(debug_assertions)]
+use crate::layout_debug;
+use crate::model::{
+    self, style_length, IntrinsicISizes, IntrinsicISizesContribution, MaybeAuto, SizeConstraint,
+};
+use crate::text::TextRunScanner;
+use crate::wrapper::ThreadSafeLayoutNodeHelpers;
+use crate::{text, ServoArc};
 
 // From gfxFontConstants.h in Firefox.
 static FONT_SUBSCRIPT_OFFSET_RATIO: f32 = 0.20;
@@ -158,6 +166,11 @@ pub struct Fragment {
     pub established_reference_frame: Option<ClipScrollNodeIndex>,
 }
 
+#[cfg(debug_assertions)]
+size_of_test!(Fragment, 176);
+#[cfg(not(debug_assertions))]
+size_of_test!(Fragment, 152);
+
 impl Serialize for Fragment {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let mut serializer = serializer.serialize_struct("fragment", 3)?;
@@ -211,6 +224,8 @@ pub enum SpecificFragmentInfo {
     /// Other fragments can only be totally truncated or not truncated at all.
     TruncatedFragment(Box<TruncatedFragmentInfo>),
 }
+
+size_of_test!(SpecificFragmentInfo, 24);
 
 impl SpecificFragmentInfo {
     fn restyle_damage(&self) -> RestyleDamage {
@@ -336,9 +351,9 @@ impl InlineAbsoluteFragmentInfo {
 
 #[derive(Clone)]
 pub enum CanvasFragmentSource {
-    WebGL(webrender_api::ImageKey),
+    WebGL(ImageKey),
     Image(Option<Arc<Mutex<IpcSender<CanvasMsg>>>>),
-    WebGPU(webrender_api::ImageKey),
+    WebGPU(ImageKey),
 }
 
 #[derive(Clone)]
@@ -527,6 +542,7 @@ pub struct ScannedTextFragmentInfo {
 }
 
 bitflags! {
+    #[derive(Clone, Copy)]
     pub struct ScannedTextFlags: u8 {
         /// Whether a line break is required after this fragment if wrapping on newlines (e.g. if
         /// `white-space: pre` is in effect).
@@ -677,18 +693,27 @@ impl Fragment {
         let mut restyle_damage = node.restyle_damage();
         restyle_damage.remove(ServoRestyleDamage::RECONSTRUCT_FLOW);
 
+        let mut flags = FragmentFlags::empty();
+        let is_body = node
+            .as_element()
+            .map(|element| element.is_body_element_of_html_element_root())
+            .unwrap_or(false);
+        if is_body {
+            flags |= FragmentFlags::IS_BODY_ELEMENT_OF_HTML_ELEMENT_ROOT;
+        }
+
         Fragment {
             node: node.opaque(),
-            style: style,
+            style,
             selected_style: node.selected_style(),
-            restyle_damage: restyle_damage,
+            restyle_damage,
             border_box: LogicalRect::zero(writing_mode),
             border_padding: LogicalMargin::zero(writing_mode),
             margin: LogicalMargin::zero(writing_mode),
-            specific: specific,
+            specific,
             inline_context: None,
             pseudo: node.get_pseudo_element_type(),
-            flags: FragmentFlags::empty(),
+            flags,
             debug_id: DebugId::new(),
             stacking_context_id: StackingContextId::root(),
             established_reference_frame: None,
@@ -1164,11 +1189,11 @@ impl Fragment {
             // https://drafts.csswg.org/css2/visudet.html#min-max-widths
             (MaybeAuto::Auto, MaybeAuto::Auto) => {
                 if self.has_intrinsic_ratio() {
-                    // This approch follows the spirit of cover and contain constraint.
+                    // This approach follows the spirit of cover and contain constraint.
                     // https://drafts.csswg.org/css-images-3/#cover-contain
 
                     // First, create two rectangles that keep aspect ratio while may be clamped
-                    // by the contraints;
+                    // by the constraints;
                     let first_isize = inline_constraint.clamp(intrinsic_inline_size);
                     let first_bsize = Au::new(
                         (first_isize.0 as i64 * intrinsic_block_size.0 as i64 /
@@ -1492,7 +1517,9 @@ impl Fragment {
         if let Some(ref inline_fragment_context) = self.inline_context {
             for node in &inline_fragment_context.nodes {
                 if node.style.get_box().position == Position::Relative {
-                    rel_pos = rel_pos + from_style(&*node.style, containing_block_size);
+                    // TODO(servo#30577) revert once underlying bug is fixed
+                    // rel_pos = rel_pos + from_style(&*node.style, containing_block_size);
+                    rel_pos = rel_pos.add_or_warn(from_style(&*node.style, containing_block_size));
                 }
             }
         }
@@ -2733,9 +2760,11 @@ impl Fragment {
     }
 
     /// Returns true if this fragment has a transform applied that causes it to take up no space.
-    pub fn has_non_invertible_transform(&self) -> bool {
+    pub fn has_non_invertible_transform_or_zero_scale(&self) -> bool {
         self.transform_matrix(&Rect::default())
-            .map_or(false, |matrix| !matrix.is_invertible())
+            .map_or(false, |matrix| {
+                !matrix.is_invertible() || matrix.m11 == 0. || matrix.m22 == 0.
+            })
     }
 
     /// Returns true if this fragment establishes a new stacking context and false otherwise.
@@ -3205,22 +3234,18 @@ impl Fragment {
             .to_f32_px();
         let transform_origin_z = transform_origin.depth.px();
 
-        let pre_transform = LayoutTransform::create_translation(
+        let pre_transform = LayoutTransform::translation(
             transform_origin_x,
             transform_origin_y,
             transform_origin_z,
         );
-        let post_transform = LayoutTransform::create_translation(
+        let post_transform = LayoutTransform::translation(
             -transform_origin_x,
             -transform_origin_y,
             -transform_origin_z,
         );
 
-        Some(
-            pre_transform
-                .pre_transform(&transform)
-                .pre_transform(&post_transform),
-        )
+        Some(post_transform.then(&transform).then(&pre_transform))
     }
 
     /// Returns the 4D matrix representing this fragment's perspective.
@@ -3241,25 +3266,19 @@ impl Fragment {
                 )
                 .to_layout();
 
-                let pre_transform = LayoutTransform::create_translation(
-                    perspective_origin.x,
-                    perspective_origin.y,
-                    0.0,
-                );
-                let post_transform = LayoutTransform::create_translation(
-                    -perspective_origin.x,
-                    -perspective_origin.y,
-                    0.0,
-                );
+                let pre_transform =
+                    LayoutTransform::translation(perspective_origin.x, perspective_origin.y, 0.0);
+                let post_transform =
+                    LayoutTransform::translation(-perspective_origin.x, -perspective_origin.y, 0.0);
 
                 let perspective_matrix = LayoutTransform::from_untyped(
                     &transform::create_perspective_matrix(length.px()),
                 );
 
                 Some(
-                    pre_transform
-                        .pre_transform(&perspective_matrix)
-                        .pre_transform(&post_transform),
+                    post_transform
+                        .then(&perspective_matrix)
+                        .then(&pre_transform),
                 )
             },
             Perspective::None => None,
@@ -3287,16 +3306,24 @@ impl fmt::Debug for Fragment {
             "".to_owned()
         };
 
+        let flags_string = if !self.flags.is_empty() {
+            format!("\nflags={:?}", self.flags)
+        } else {
+            "".to_owned()
+        };
+
         write!(
             f,
-            "\n{}({}) [{:?}]\nborder_box={:?}{}{}{}",
+            "\n{}({}) [{:?}]\
+            \nborder_box={:?}\
+            {border_padding_string}\
+            {margin_string}\
+            {damage_string}\
+            {flags_string}",
             self.specific.get_type(),
             self.debug_id,
             self.specific,
             self.border_box,
-            border_padding_string,
-            margin_string,
-            damage_string
         )
     }
 }
@@ -3314,10 +3341,10 @@ bitflags! {
     // Various flags we can use when splitting fragments. See
     // `calculate_split_position_using_breaking_strategy()`.
     struct SplitOptions: u8 {
-        #[doc = "True if this is the first fragment on the line."]
+        /// True if this is the first fragment on the line."]
         const STARTS_LINE = 0x01;
-        #[doc = "True if we should attempt to split at character boundaries if this split fails. \
-                 This is used to implement `overflow-wrap: break-word`."]
+        /// True if we should attempt to split at character boundaries if this split fails. \
+        /// This is used to implement `overflow-wrap: break-word`."]
         const RETRY_AT_CHARACTER_BOUNDARIES = 0x02;
     }
 }
@@ -3432,6 +3459,7 @@ impl Overflow {
 }
 
 bitflags! {
+    #[derive(Clone, Debug)]
     pub struct FragmentFlags: u8 {
         // TODO(stshine): find a better name since these flags can also be used for grid item.
         /// Whether this fragment represents a child in a row flex container.
@@ -3440,6 +3468,8 @@ bitflags! {
         const IS_BLOCK_FLEX_ITEM = 0b0000_0010;
         /// Whether this fragment represents the generated text from a text-overflow clip.
         const IS_ELLIPSIS = 0b0000_0100;
+        /// Whether this fragment is for the body element child of a html element root element.
+        const IS_BODY_ELEMENT_OF_HTML_ELEMENT_ROOT =  0b0000_1000;
     }
 }
 

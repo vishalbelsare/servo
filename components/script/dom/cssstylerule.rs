@@ -2,6 +2,16 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+use std::mem;
+
+use cssparser::{Parser as CssParser, ParserInput as CssParserInput, ToCss};
+use dom_struct::dom_struct;
+use selectors::parser::SelectorList;
+use servo_arc::Arc;
+use style::selector_parser::SelectorParser;
+use style::shared_lock::{Locked, ToCssWithGuard};
+use style::stylesheets::{Origin, StyleRule};
+
 use crate::dom::bindings::codegen::Bindings::CSSStyleRuleBinding::CSSStyleRuleMethods;
 use crate::dom::bindings::inheritance::Castable;
 use crate::dom::bindings::reflector::{reflect_dom_object, DomObject};
@@ -12,20 +22,12 @@ use crate::dom::cssstyledeclaration::{CSSModificationAccess, CSSStyleDeclaration
 use crate::dom::cssstylesheet::CSSStyleSheet;
 use crate::dom::node::{stylesheets_owner_from_node, Node};
 use crate::dom::window::Window;
-use cssparser::ToCss;
-use cssparser::{Parser as CssParser, ParserInput as CssParserInput};
-use dom_struct::dom_struct;
-use selectors::parser::SelectorList;
-use servo_arc::Arc;
-use std::mem;
-use style::selector_parser::SelectorParser;
-use style::shared_lock::{Locked, ToCssWithGuard};
-use style::stylesheets::{Origin, StyleRule};
 
 #[dom_struct]
 pub struct CSSStyleRule {
     cssrule: CSSRule,
     #[ignore_malloc_size_of = "Arc"]
+    #[no_trace]
     stylerule: Arc<Locked<StyleRule>>,
     style_decl: MutNullableDom<CSSStyleDeclaration>,
 }
@@ -42,7 +44,7 @@ impl CSSStyleRule {
         }
     }
 
-    #[allow(unrooted_must_root)]
+    #[allow(crown::unrooted_must_root)]
     pub fn new(
         window: &Window,
         parent_stylesheet: &CSSStyleSheet,
@@ -96,19 +98,16 @@ impl CSSStyleRuleMethods for CSSStyleRule {
 
     // https://drafts.csswg.org/cssom/#dom-cssstylerule-selectortext
     fn SetSelectorText(&self, value: DOMString) {
+        let contents = &self.cssrule.parent_stylesheet().style_stylesheet().contents;
         // It's not clear from the spec if we should use the stylesheet's namespaces.
         // https://github.com/w3c/csswg-drafts/issues/1511
-        let namespaces = self
-            .cssrule
-            .parent_stylesheet()
-            .style_stylesheet()
-            .contents
-            .namespaces
-            .read();
+        let namespaces = contents.namespaces.read();
+        let url_data = contents.url_data.read();
         let parser = SelectorParser {
             stylesheet_origin: Origin::Author,
             namespaces: &namespaces,
-            url_data: None,
+            url_data: &url_data,
+            for_supports_rule: false,
         };
         let mut css_parser = CssParserInput::new(&*value);
         let mut css_parser = CssParser::new(&mut css_parser);

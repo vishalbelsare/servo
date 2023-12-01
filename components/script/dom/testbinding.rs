@@ -4,43 +4,41 @@
 
 // check-tidy: no specs after this line
 
+use std::borrow::ToOwned;
+use std::ptr;
+use std::ptr::NonNull;
+use std::rc::Rc;
+
+use dom_struct::dom_struct;
+use js::jsapi::{Heap, JSObject, JS_NewPlainObject, JS_NewUint8ClampedArray};
+use js::jsval::{JSVal, NullValue};
+use js::rust::{CustomAutoRooterGuard, HandleObject, HandleValue};
+use js::typedarray;
+use script_traits::serializable::BlobImpl;
+use script_traits::MsDuration;
+use servo_config::prefs;
+
 use crate::dom::bindings::callback::ExceptionHandling;
 use crate::dom::bindings::codegen::Bindings::EventListenerBinding::EventListener;
 use crate::dom::bindings::codegen::Bindings::FunctionBinding::Function;
-use crate::dom::bindings::codegen::Bindings::TestBindingBinding::SimpleCallback;
-use crate::dom::bindings::codegen::Bindings::TestBindingBinding::TestDictionaryParent;
-use crate::dom::bindings::codegen::Bindings::TestBindingBinding::TestDictionaryWithParent;
 use crate::dom::bindings::codegen::Bindings::TestBindingBinding::{
-    TestBindingMethods, TestDictionary,
-};
-use crate::dom::bindings::codegen::Bindings::TestBindingBinding::{
-    TestDictionaryDefaults, TestEnum, TestURLLike,
+    SimpleCallback, TestBindingMethods, TestDictionary, TestDictionaryDefaults,
+    TestDictionaryParent, TestDictionaryWithParent, TestEnum, TestURLLike,
 };
 use crate::dom::bindings::codegen::UnionTypes;
 use crate::dom::bindings::codegen::UnionTypes::{
-    BlobOrBlobSequence, BlobOrBoolean, LongOrLongSequenceSequence,
-};
-use crate::dom::bindings::codegen::UnionTypes::{BlobOrString, BlobOrUnsignedLong, EventOrString};
-use crate::dom::bindings::codegen::UnionTypes::{
-    ByteStringOrLong, ByteStringSequenceOrLongOrString,
-};
-use crate::dom::bindings::codegen::UnionTypes::{ByteStringSequenceOrLong, DocumentOrTestTypedef};
-use crate::dom::bindings::codegen::UnionTypes::{
-    EventOrUSVString, HTMLElementOrLong, LongSequenceOrTestTypedef,
-};
-use crate::dom::bindings::codegen::UnionTypes::{
-    HTMLElementOrUnsignedLongOrStringOrBoolean, LongSequenceOrBoolean,
-};
-use crate::dom::bindings::codegen::UnionTypes::{StringOrBoolean, UnsignedLongOrBoolean};
-use crate::dom::bindings::codegen::UnionTypes::{StringOrLongSequence, StringOrStringSequence};
-use crate::dom::bindings::codegen::UnionTypes::{
-    StringOrUnsignedLong, StringSequenceOrUnsignedLong,
+    BlobOrBlobSequence, BlobOrBoolean, BlobOrString, BlobOrUnsignedLong, ByteStringOrLong,
+    ByteStringSequenceOrLong, ByteStringSequenceOrLongOrString, DocumentOrTestTypedef,
+    EventOrString, EventOrUSVString, HTMLElementOrLong, HTMLElementOrUnsignedLongOrStringOrBoolean,
+    LongOrLongSequenceSequence, LongSequenceOrBoolean, LongSequenceOrTestTypedef, StringOrBoolean,
+    StringOrLongSequence, StringOrStringSequence, StringOrUnsignedLong,
+    StringSequenceOrUnsignedLong, UnsignedLongOrBoolean,
 };
 use crate::dom::bindings::error::{Error, Fallible};
 use crate::dom::bindings::num::Finite;
 use crate::dom::bindings::record::Record;
 use crate::dom::bindings::refcounted::TrustedPromise;
-use crate::dom::bindings::reflector::{reflect_dom_object, DomObject, Reflector};
+use crate::dom::bindings::reflector::{reflect_dom_object_with_proto, DomObject, Reflector};
 use crate::dom::bindings::root::DomRoot;
 use crate::dom::bindings::str::{ByteString, DOMString, USVString};
 use crate::dom::bindings::trace::RootedTraceableBox;
@@ -54,20 +52,6 @@ use crate::dom::url::URL;
 use crate::realms::InRealm;
 use crate::script_runtime::JSContext as SafeJSContext;
 use crate::timers::OneshotTimerCallback;
-use dom_struct::dom_struct;
-use js::jsapi::{Heap, JSObject};
-use js::jsapi::{JS_NewPlainObject, JS_NewUint8ClampedArray};
-use js::jsval::{JSVal, NullValue};
-use js::rust::CustomAutoRooterGuard;
-use js::rust::{HandleObject, HandleValue};
-use js::typedarray;
-use script_traits::serializable::BlobImpl;
-use script_traits::MsDuration;
-use servo_config::prefs;
-use std::borrow::ToOwned;
-use std::ptr;
-use std::ptr::NonNull;
-use std::rc::Rc;
 
 #[dom_struct]
 pub struct TestBinding {
@@ -84,22 +68,33 @@ impl TestBinding {
         }
     }
 
-    pub fn new(global: &GlobalScope) -> DomRoot<TestBinding> {
-        reflect_dom_object(Box::new(TestBinding::new_inherited()), global)
+    fn new(global: &GlobalScope, proto: Option<HandleObject>) -> DomRoot<TestBinding> {
+        reflect_dom_object_with_proto(Box::new(TestBinding::new_inherited()), global, proto)
     }
 
-    pub fn Constructor(global: &GlobalScope) -> Fallible<DomRoot<TestBinding>> {
-        Ok(TestBinding::new(global))
+    pub fn Constructor(
+        global: &GlobalScope,
+        proto: Option<HandleObject>,
+    ) -> Fallible<DomRoot<TestBinding>> {
+        Ok(TestBinding::new(global, proto))
     }
 
     #[allow(unused_variables)]
-    pub fn Constructor_(global: &GlobalScope, nums: Vec<f64>) -> Fallible<DomRoot<TestBinding>> {
-        Ok(TestBinding::new(global))
+    pub fn Constructor_(
+        global: &GlobalScope,
+        proto: Option<HandleObject>,
+        nums: Vec<f64>,
+    ) -> Fallible<DomRoot<TestBinding>> {
+        Ok(TestBinding::new(global, proto))
     }
 
     #[allow(unused_variables)]
-    pub fn Constructor__(global: &GlobalScope, num: f64) -> Fallible<DomRoot<TestBinding>> {
-        Ok(TestBinding::new(global))
+    pub fn Constructor__(
+        global: &GlobalScope,
+        proto: Option<HandleObject>,
+        num: f64,
+    ) -> Fallible<DomRoot<TestBinding>> {
+        Ok(TestBinding::new(global, proto))
     }
 }
 
@@ -958,12 +953,12 @@ impl TestBindingMethods for TestBinding {
         Record::new()
     }
 
-    #[allow(unrooted_must_root)]
+    #[allow(crown::unrooted_must_root)]
     fn ReturnResolvedPromise(&self, cx: SafeJSContext, v: HandleValue) -> Fallible<Rc<Promise>> {
         Promise::new_resolved(&self.global(), cx, v)
     }
 
-    #[allow(unrooted_must_root)]
+    #[allow(crown::unrooted_must_root)]
     fn ReturnRejectedPromise(&self, cx: SafeJSContext, v: HandleValue) -> Fallible<Rc<Promise>> {
         Promise::new_rejected(&self.global(), cx, v)
     }
@@ -980,7 +975,7 @@ impl TestBindingMethods for TestBinding {
         p.reject_error(Error::Type(s.0));
     }
 
-    #[allow(unrooted_must_root)]
+    #[allow(crown::unrooted_must_root)]
     fn ResolvePromiseDelayed(&self, p: &Promise, value: DOMString, delay: u64) {
         let promise = p.duplicate();
         let cb = TestBindingCallback {
@@ -1005,7 +1000,7 @@ impl TestBindingMethods for TestBinding {
             resolve.map(SimpleHandler::new),
             reject.map(SimpleHandler::new),
         );
-        let p = Promise::new_in_current_realm(&global, comp.clone());
+        let p = Promise::new_in_current_realm(comp.clone());
         p.append_native_handler(&handler, comp);
         return p;
 
@@ -1028,7 +1023,7 @@ impl TestBindingMethods for TestBinding {
     }
 
     fn PromiseAttribute(&self, comp: InRealm) -> Rc<Promise> {
-        Promise::new_in_current_realm(&self.global(), comp)
+        Promise::new_in_current_realm(comp)
     }
 
     fn AcceptPromise(&self, _promise: &Promise) {}
@@ -1134,7 +1129,7 @@ pub struct TestBindingCallback {
 }
 
 impl TestBindingCallback {
-    #[allow(unrooted_must_root)]
+    #[allow(crown::unrooted_must_root)]
     pub fn invoke(self) {
         self.promise.root().resolve_native(&self.value);
     }

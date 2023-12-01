@@ -2,24 +2,103 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+use std::borrow::{Cow, ToOwned};
+use std::cell::Cell;
+use std::collections::hash_map::Entry;
+use std::collections::{HashMap, HashSet};
+use std::default::Default;
+use std::io::{stderr, stdout, Write};
+use std::ptr::NonNull;
+use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::{cmp, env, mem};
+
+use app_units::Au;
+use backtrace::Backtrace;
+use base64::Engine;
+use bluetooth_traits::BluetoothRequest;
+use canvas_traits::webgl::WebGLChan;
+use crossbeam_channel::{unbounded, Sender, TryRecvError};
+use cssparser::{Parser, ParserInput, SourceLocation};
+use devtools_traits::{ScriptToDevtoolsControlMsg, TimelineMarker, TimelineMarkerType};
+use dom_struct::dom_struct;
+use embedder_traits::{EmbedderMsg, PromptDefinition, PromptOrigin, PromptResult};
+use euclid::default::{Point2D as UntypedPoint2D, Rect as UntypedRect};
+use euclid::{Point2D, Rect, Scale, Size2D, Vector2D};
+use ipc_channel::ipc::IpcSender;
+use ipc_channel::router::ROUTER;
+use js::conversions::ToJSValConvertible;
+use js::jsapi::{GCReason, Heap, JSAutoRealm, JSObject, StackFormat, JSPROP_ENUMERATE, JS_GC};
+use js::jsval::{JSVal, NullValue, UndefinedValue};
+use js::rust::wrappers::JS_DefineProperty;
+use js::rust::{
+    CustomAutoRooter, CustomAutoRooterGuard, HandleObject, HandleValue, MutableHandleObject,
+};
+use malloc_size_of::MallocSizeOf;
+use media::WindowGLContext;
+use msg::constellation_msg::{BrowsingContextId, PipelineId};
+use net_traits::image_cache::{
+    ImageCache, ImageResponder, ImageResponse, PendingImageId, PendingImageResponse,
+};
+use net_traits::storage_thread::StorageType;
+use net_traits::ResourceThreads;
+use num_traits::ToPrimitive;
+use parking_lot::Mutex as ParkMutex;
+use profile_traits::ipc as ProfiledIpc;
+use profile_traits::mem::ProfilerChan as MemProfilerChan;
+use profile_traits::time::{ProfilerChan as TimeProfilerChan, ProfilerMsg};
+use script_layout_interface::message::{Msg, QueryMsg, Reflow, ReflowGoal, ScriptReflow};
+use script_layout_interface::rpc::{
+    ContentBoxResponse, ContentBoxesResponse, LayoutRPC, NodeScrollIdResponse,
+    ResolvedStyleResponse, TextIndexResponse,
+};
+use script_layout_interface::{PendingImageState, TrustedNodeAddress};
+use script_traits::webdriver_msg::{WebDriverJSError, WebDriverJSResult};
+use script_traits::{
+    ConstellationControlMsg, DocumentState, HistoryEntryReplacement, LoadData, ScriptMsg,
+    ScriptToConstellationChan, ScrollState, StructuredSerializedData, TimerEventId,
+    TimerSchedulerMsg, WebrenderIpcSender, WindowSizeData, WindowSizeType,
+};
+use selectors::attr::CaseSensitivity;
+use servo_arc::Arc as ServoArc;
+use servo_atoms::Atom;
+use servo_geometry::{f32_rect_to_au_rect, MaxRect};
+use servo_url::{ImmutableOrigin, MutableOrigin, ServoUrl};
+use style::dom::OpaqueNode;
+use style::error_reporting::{ContextualParseError, ParseErrorReporter};
+use style::media_queries;
+use style::parser::ParserContext as CssParserContext;
+use style::properties::style_structs::Font;
+use style::properties::{PropertyId, ShorthandId};
+use style::selector_parser::PseudoElement;
+use style::str::HTML_SPACE_CHARACTERS;
+use style::stylesheets::{CssRuleType, Origin};
+use style_traits::{CSSPixel, DevicePixel, ParsingMode};
+use url::Position;
+use webrender_api::units::{DeviceIntPoint, DeviceIntSize, LayoutPixel};
+use webrender_api::{DocumentId, ExternalScrollId};
+
+use super::bindings::trace::HashMapTracedValues;
 use crate::dom::bindings::cell::{DomRefCell, Ref};
 use crate::dom::bindings::codegen::Bindings::DocumentBinding::{
     DocumentMethods, DocumentReadyState,
 };
-use crate::dom::bindings::codegen::Bindings::HistoryBinding::HistoryBinding::HistoryMethods;
+use crate::dom::bindings::codegen::Bindings::HTMLIFrameElementBinding::HTMLIFrameElementMethods;
+use crate::dom::bindings::codegen::Bindings::HistoryBinding::History_Binding::HistoryMethods;
 use crate::dom::bindings::codegen::Bindings::ImageBitmapBinding::{
     ImageBitmapOptions, ImageBitmapSource,
 };
-use crate::dom::bindings::codegen::Bindings::MediaQueryListBinding::MediaQueryListBinding::MediaQueryListMethods;
+use crate::dom::bindings::codegen::Bindings::MediaQueryListBinding::MediaQueryList_Binding::MediaQueryListMethods;
 use crate::dom::bindings::codegen::Bindings::RequestBinding::RequestInit;
 use crate::dom::bindings::codegen::Bindings::VoidFunctionBinding::VoidFunction;
 use crate::dom::bindings::codegen::Bindings::WindowBinding::{
-    self, FrameRequestCallback, WindowMethods, WindowPostMessageOptions,
+    self, FrameRequestCallback, ScrollBehavior, ScrollToOptions, WindowMethods,
+    WindowPostMessageOptions,
 };
-use crate::dom::bindings::codegen::Bindings::WindowBinding::{ScrollBehavior, ScrollToOptions};
 use crate::dom::bindings::codegen::UnionTypes::{RequestOrUSVString, StringOrFunction};
 use crate::dom::bindings::error::{Error, ErrorResult, Fallible};
-use crate::dom::bindings::inheritance::Castable;
+use crate::dom::bindings::inheritance::{Castable, ElementTypeId, HTMLElementTypeId, NodeTypeId};
 use crate::dom::bindings::num::Finite;
 use crate::dom::bindings::refcounted::Trusted;
 use crate::dom::bindings::reflector::DomObject;
@@ -40,6 +119,8 @@ use crate::dom::eventtarget::EventTarget;
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::hashchangeevent::HashChangeEvent;
 use crate::dom::history::History;
+use crate::dom::htmlcollection::{CollectionFilter, HTMLCollection};
+use crate::dom::htmliframeelement::HTMLIFrameElement;
 use crate::dom::identityhub::Identities;
 use crate::dom::location::Location;
 use crate::dom::mediaquerylist::{MediaQueryList, MediaQueryListMatchState};
@@ -57,96 +138,21 @@ use crate::dom::webglrenderingcontext::WebGLCommandSender;
 use crate::dom::windowproxy::WindowProxy;
 use crate::dom::worklet::Worklet;
 use crate::dom::workletglobalscope::WorkletGlobalScopeType;
-use crate::fetch;
 use crate::layout_image::fetch_image_for_layout;
-use crate::malloc_size_of::MallocSizeOf;
 use crate::microtask::MicrotaskQueue;
 use crate::realms::InRealm;
 use crate::script_runtime::{
     CommonScriptMsg, JSContext, Runtime, ScriptChan, ScriptPort, ScriptThreadEventCategory,
 };
-use crate::script_thread::{ImageCacheMsg, MainThreadScriptChan, MainThreadScriptMsg};
-use crate::script_thread::{ScriptThread, SendableMainThreadScriptChan};
+use crate::script_thread::{
+    ImageCacheMsg, MainThreadScriptChan, MainThreadScriptMsg, ScriptThread,
+    SendableMainThreadScriptChan,
+};
 use crate::task_manager::TaskManager;
 use crate::task_source::{TaskSource, TaskSourceName};
 use crate::timers::{IsInterval, TimerCallback};
 use crate::webdriver_handlers::jsval_to_webdriver;
-use app_units::Au;
-use backtrace::Backtrace;
-use base64;
-use bluetooth_traits::BluetoothRequest;
-use canvas_traits::webgl::WebGLChan;
-use crossbeam_channel::{unbounded, Sender, TryRecvError};
-use cssparser::{Parser, ParserInput, SourceLocation};
-use devtools_traits::{ScriptToDevtoolsControlMsg, TimelineMarker, TimelineMarkerType};
-use dom_struct::dom_struct;
-use embedder_traits::{EmbedderMsg, EventLoopWaker, PromptDefinition, PromptOrigin, PromptResult};
-use euclid::default::{Point2D as UntypedPoint2D, Rect as UntypedRect};
-use euclid::{Point2D, Rect, Scale, Size2D, Vector2D};
-use ipc_channel::ipc::IpcSender;
-use ipc_channel::router::ROUTER;
-use js::conversions::ToJSValConvertible;
-use js::jsapi::Heap;
-use js::jsapi::JSAutoRealm;
-use js::jsapi::JSObject;
-use js::jsapi::JSPROP_ENUMERATE;
-use js::jsapi::{GCReason, StackFormat, JS_GC};
-use js::jsval::UndefinedValue;
-use js::jsval::{JSVal, NullValue};
-use js::rust::wrappers::JS_DefineProperty;
-use js::rust::{CustomAutoRooter, CustomAutoRooterGuard, HandleValue};
-use media::WindowGLContext;
-use msg::constellation_msg::{BrowsingContextId, PipelineId};
-use net_traits::image_cache::{ImageCache, ImageResponder, ImageResponse};
-use net_traits::image_cache::{PendingImageId, PendingImageResponse};
-use net_traits::storage_thread::StorageType;
-use net_traits::ResourceThreads;
-use num_traits::ToPrimitive;
-use parking_lot::Mutex as ParkMutex;
-use profile_traits::ipc as ProfiledIpc;
-use profile_traits::mem::ProfilerChan as MemProfilerChan;
-use profile_traits::time::{ProfilerChan as TimeProfilerChan, ProfilerMsg};
-use script_layout_interface::message::{Msg, QueryMsg, Reflow, ReflowGoal, ScriptReflow};
-use script_layout_interface::rpc::{ContentBoxResponse, ContentBoxesResponse, LayoutRPC};
-use script_layout_interface::rpc::{
-    NodeScrollIdResponse, ResolvedStyleResponse, TextIndexResponse,
-};
-use script_layout_interface::{PendingImageState, TrustedNodeAddress};
-use script_traits::webdriver_msg::{WebDriverJSError, WebDriverJSResult};
-use script_traits::{ConstellationControlMsg, DocumentState, HistoryEntryReplacement, LoadData};
-use script_traits::{
-    ScriptMsg, ScriptToConstellationChan, ScrollState, StructuredSerializedData, TimerEventId,
-};
-use script_traits::{TimerSchedulerMsg, WebrenderIpcSender, WindowSizeData, WindowSizeType};
-use selectors::attr::CaseSensitivity;
-use servo_arc::Arc as ServoArc;
-use servo_geometry::{f32_rect_to_au_rect, MaxRect};
-use servo_url::{ImmutableOrigin, MutableOrigin, ServoUrl};
-use std::borrow::Cow;
-use std::borrow::ToOwned;
-use std::cell::Cell;
-use std::collections::hash_map::Entry;
-use std::collections::{HashMap, HashSet};
-use std::default::Default;
-use std::env;
-use std::io::{stderr, stdout, Write};
-use std::mem;
-use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
-use style::dom::OpaqueNode;
-use style::error_reporting::{ContextualParseError, ParseErrorReporter};
-use style::media_queries;
-use style::parser::ParserContext as CssParserContext;
-use style::properties::style_structs::Font;
-use style::properties::{PropertyId, ShorthandId};
-use style::selector_parser::PseudoElement;
-use style::str::HTML_SPACE_CHARACTERS;
-use style::stylesheets::{CssRuleType, Origin};
-use style_traits::{CSSPixel, DevicePixel, ParsingMode};
-use url::Position;
-use webrender_api::units::{DeviceIntPoint, DeviceIntSize, LayoutPixel};
-use webrender_api::{DocumentId, ExternalScrollId};
+use crate::{fetch, window_named_properties};
 
 /// Current state of the window object
 #[derive(Clone, Copy, Debug, JSTraceable, MallocSizeOf, PartialEq)]
@@ -159,26 +165,27 @@ enum WindowState {
 #[derive(Debug, MallocSizeOf)]
 pub enum ReflowReason {
     CachedPageNeededReflow,
-    RefreshTick,
-    FirstLoad,
-    KeyEvent,
-    MouseEvent,
-    Query,
-    Timer,
-    Viewport,
-    WindowResize,
     DOMContentLoaded,
     DocumentLoaded,
-    StylesheetLoaded,
-    ImageLoaded,
-    RequestAnimationFrame,
-    WebFontLoaded,
-    WorkletLoaded,
+    ElementStateChanged,
+    FirstLoad,
     FramedContentChanged,
     IFrameLoadEvent,
+    ImageLoaded,
+    KeyEvent,
     MissingExplicitReflow,
-    ElementStateChanged,
+    MouseEvent,
     PendingReflow,
+    Query,
+    RefreshTick,
+    RequestAnimationFrame,
+    ScrollFromScript,
+    StylesheetLoaded,
+    Timer,
+    Viewport,
+    WebFontLoaded,
+    WindowResize,
+    WorkletLoaded,
 }
 
 #[dom_struct]
@@ -189,8 +196,10 @@ pub struct Window {
     task_manager: TaskManager,
     navigator: MutNullableDom<Navigator>,
     #[ignore_malloc_size_of = "Arc"]
+    #[no_trace]
     image_cache: Arc<dyn ImageCache>,
     #[ignore_malloc_size_of = "channels are hard"]
+    #[no_trace]
     image_cache_chan: Sender<ImageCacheMsg>,
     window_proxy: MutNullableDom<WindowProxy>,
     document: MutNullableDom<Document>,
@@ -207,14 +216,18 @@ pub struct Window {
 
     /// For sending timeline markers. Will be ignored if
     /// no devtools server
+    #[no_trace]
     devtools_markers: DomRefCell<HashSet<TimelineMarkerType>>,
     #[ignore_malloc_size_of = "channels are hard"]
+    #[no_trace]
     devtools_marker_sender: DomRefCell<Option<IpcSender<Option<TimelineMarker>>>>,
 
     /// Pending resize event, if any.
+    #[no_trace]
     resize_event: Cell<Option<(WindowSizeData, WindowSizeType)>>,
 
     /// Parent id associated with this page, if any.
+    #[no_trace]
     parent_info: Option<PipelineId>,
 
     /// Global static data related to the DOM.
@@ -229,23 +242,28 @@ pub struct Window {
     /// This channel shouldn't be accessed directly, but through `Window::layout_chan()`,
     /// which returns `None` if there's no layout thread anymore.
     #[ignore_malloc_size_of = "channels are hard"]
+    #[no_trace]
     layout_chan: Sender<Msg>,
 
     /// A handle to perform RPC calls into the layout, quickly.
     #[ignore_malloc_size_of = "trait objects are hard"]
+    #[no_trace]
     layout_rpc: Box<dyn LayoutRPC + Send + 'static>,
 
     /// The current size of the window, in pixels.
+    #[no_trace]
     window_size: Cell<WindowSizeData>,
 
     /// A handle for communicating messages to the bluetooth thread.
     #[ignore_malloc_size_of = "channels are hard"]
+    #[no_trace]
     bluetooth_thread: IpcSender<BluetoothRequest>,
 
     bluetooth_extra_permission_data: BluetoothExtraPermissionData,
 
     /// An enlarged rectangle around the page contents visible in the viewport, used
     /// to prevent creating display list items for content that is far away from the viewport.
+    #[no_trace]
     page_clip_rect: Cell<UntypedRect<Au>>,
 
     /// Flag to suppress reflows. The first reflow will come either with
@@ -258,16 +276,19 @@ pub struct Window {
 
     /// A channel for communicating results of async scripts back to the webdriver server
     #[ignore_malloc_size_of = "channels are hard"]
+    #[no_trace]
     webdriver_script_chan: DomRefCell<Option<IpcSender<WebDriverJSResult>>>,
 
     /// The current state of the window object
     current_state: Cell<WindowState>,
 
+    #[no_trace]
     current_viewport: Cell<UntypedRect<Au>>,
 
     error_reporter: CSSErrorReporter,
 
     /// A list of scroll offsets for each scrollable element.
+    #[no_trace]
     scroll_offsets: DomRefCell<HashMap<OpaqueNode, Vector2D<f32, LayoutPixel>>>,
 
     /// All the MediaQueryLists we need to update
@@ -277,16 +298,18 @@ pub struct Window {
 
     /// A handle for communicating messages to the WebGL thread, if available.
     #[ignore_malloc_size_of = "channels are hard"]
+    #[no_trace]
     webgl_chan: Option<WebGLChan>,
 
     #[ignore_malloc_size_of = "defined in webxr"]
+    #[no_trace]
     webxr_registry: webxr_api::Registry,
 
     /// All of the elements that have an outstanding image request that was
     /// initiated by layout during a reflow. They are stored in the script thread
     /// to ensure that the element can be marked dirty when the image data becomes
     /// available at some point in the future.
-    pending_layout_images: DomRefCell<HashMap<PendingImageId, Vec<Dom<Node>>>>,
+    pending_layout_images: DomRefCell<HashMapTracedValues<PendingImageId, Vec<Dom<Node>>>>,
 
     /// Directory to store unminified scripts for this window if unminify-js
     /// opt is enabled.
@@ -301,6 +324,7 @@ pub struct Window {
     paint_worklet: MutNullableDom<Worklet>,
     /// The Webrender Document id associated with this window.
     #[ignore_malloc_size_of = "defined in webrender_api"]
+    #[no_trace]
     webrender_document: DocumentId,
 
     /// Flag to identify whether mutation observers are present(true)/absent(false)
@@ -308,6 +332,7 @@ pub struct Window {
 
     /// Webrender API Sender
     #[ignore_malloc_size_of = "Wraps an IpcSender"]
+    #[no_trace]
     webrender_api_sender: WebrenderIpcSender,
 
     /// Indicate whether a SetDocumentStatus message has been sent after a reflow is complete.
@@ -338,11 +363,8 @@ pub struct Window {
 
     /// Window's GL context from application
     #[ignore_malloc_size_of = "defined in script_thread"]
+    #[no_trace]
     player_context: WindowGLContext,
-
-    /// A mechanism to force the compositor to process events.
-    #[ignore_malloc_size_of = "traits are cumbersome"]
-    event_loop_waker: Option<Box<dyn EventLoopWaker>>,
 
     visible: Cell<bool>,
 
@@ -482,7 +504,7 @@ impl Window {
     pub(crate) fn webgl_chan(&self) -> Option<WebGLCommandSender> {
         self.webgl_chan
             .as_ref()
-            .map(|chan| WebGLCommandSender::new(chan.clone(), self.get_event_loop_waker()))
+            .map(|chan| WebGLCommandSender::new(chan.clone()))
     }
 
     pub fn webxr_registry(&self) -> webxr_api::Registry {
@@ -538,10 +560,6 @@ impl Window {
         self.player_context.clone()
     }
 
-    pub fn get_event_loop_waker(&self) -> Option<Box<dyn EventLoopWaker>> {
-        self.event_loop_waker.as_ref().map(|w| (*w).clone_box())
-    }
-
     // see note at https://dom.spec.whatwg.org/#concept-event-dispatch step 2
     pub fn dispatch_event_with_target_override(&self, event: &Event) -> EventStatus {
         if self.has_document() {
@@ -567,7 +585,10 @@ pub fn base64_btoa(input: DOMString) -> Fallible<DOMString> {
 
         // "and then must apply the base64 algorithm to that sequence of
         //  octets, and return the result. [RFC4648]"
-        Ok(DOMString::from(base64::encode(&octets)))
+        let config =
+            base64::engine::general_purpose::GeneralPurposeConfig::new().with_encode_padding(true);
+        let engine = base64::engine::GeneralPurpose::new(&base64::alphabet::STANDARD, config);
+        Ok(DOMString::from(engine.encode(&octets)))
     }
 }
 
@@ -614,8 +635,12 @@ pub fn base64_atob(input: DOMString) -> Fallible<DOMString> {
         return Err(Error::InvalidCharacter);
     }
 
-    let data = base64::decode_config(&input, base64::STANDARD.decode_allow_trailing_bits(true))
-        .map_err(|_| Error::InvalidCharacter)?;
+    let config = base64::engine::general_purpose::GeneralPurposeConfig::new()
+        .with_decode_padding_mode(base64::engine::DecodePaddingMode::RequireNone)
+        .with_decode_allow_trailing_bits(true);
+    let engine = base64::engine::GeneralPurpose::new(&base64::alphabet::STANDARD, config);
+
+    let data = engine.decode(&input).map_err(|_| Error::InvalidCharacter)?;
     Ok(data.iter().map(|&b| b as char).collect::<String>().into())
 }
 
@@ -1078,11 +1103,6 @@ impl WindowMethods for Window {
     }
 
     #[allow(unsafe_code)]
-    fn Trap(&self) {
-        unsafe { ::std::intrinsics::breakpoint() }
-    }
-
-    #[allow(unsafe_code)]
     fn Js_backtrace(&self) {
         unsafe {
             capture_stack!(in(*self.get_cx()) let stack);
@@ -1313,6 +1333,7 @@ impl WindowMethods for Window {
             Some(CssRuleType::Media),
             ParsingMode::DEFAULT,
             quirks_mode,
+            /* namespaces = */ Default::default(),
             self.css_error_reporter(),
             None,
         );
@@ -1386,9 +1407,180 @@ impl WindowMethods for Window {
     fn IsSecureContext(&self) -> bool {
         self.upcast::<GlobalScope>().is_secure_context()
     }
+
+    // https://html.spec.whatwg.org/multipage/#named-access-on-the-window-object
+    #[allow(unsafe_code)]
+    fn NamedGetter(&self, _cx: JSContext, name: DOMString) -> Option<NonNull<JSObject>> {
+        if name.is_empty() {
+            return None;
+        }
+        let document = self.Document();
+
+        // https://html.spec.whatwg.org/multipage/#document-tree-child-browsing-context-name-property-set
+        let iframes: Vec<_> = document
+            .iter_iframes()
+            .filter(|iframe| {
+                if let Some(window) = iframe.GetContentWindow() {
+                    return window.get_name() == name;
+                }
+                false
+            })
+            .collect();
+
+        let iframe_iter = iframes.iter().map(|iframe| iframe.upcast::<Element>());
+
+        let name = Atom::from(&*name);
+
+        // Step 1.
+        let elements_with_name = document.get_elements_with_name(&name);
+        let name_iter = elements_with_name
+            .iter()
+            .map(|element| &**element)
+            .filter(|elem| is_named_element_with_name_attribute(elem));
+        let elements_with_id = document.get_elements_with_id(&name);
+        let id_iter = elements_with_id
+            .iter()
+            .map(|element| &**element)
+            .filter(|elem| is_named_element_with_id_attribute(elem));
+
+        // Step 2.
+        for elem in iframe_iter.clone() {
+            if let Some(nested_window_proxy) = elem
+                .downcast::<HTMLIFrameElement>()
+                .and_then(|iframe| iframe.GetContentWindow())
+            {
+                unsafe {
+                    return Some(NonNull::new_unchecked(
+                        nested_window_proxy.reflector().get_jsobject().get(),
+                    ));
+                }
+            }
+        }
+
+        let mut elements = iframe_iter.chain(name_iter).chain(id_iter);
+
+        let first = elements.next()?;
+
+        if elements.next().is_none() {
+            // Step 3.
+            unsafe {
+                return Some(NonNull::new_unchecked(
+                    first.reflector().get_jsobject().get(),
+                ));
+            }
+        }
+
+        // Step 4.
+        #[derive(JSTraceable, MallocSizeOf)]
+        struct WindowNamedGetter {
+            #[no_trace]
+            name: Atom,
+        }
+        impl CollectionFilter for WindowNamedGetter {
+            fn filter(&self, elem: &Element, _root: &Node) -> bool {
+                let type_ = match elem.upcast::<Node>().type_id() {
+                    NodeTypeId::Element(ElementTypeId::HTMLElement(type_)) => type_,
+                    _ => return false,
+                };
+                if elem.get_id().as_ref() == Some(&self.name) {
+                    return true;
+                }
+                match type_ {
+                    HTMLElementTypeId::HTMLEmbedElement |
+                    HTMLElementTypeId::HTMLFormElement |
+                    HTMLElementTypeId::HTMLImageElement |
+                    HTMLElementTypeId::HTMLObjectElement => {
+                        elem.get_name().as_ref() == Some(&self.name)
+                    },
+                    _ => false,
+                }
+            }
+        }
+        let collection = HTMLCollection::create(
+            self,
+            document.upcast(),
+            Box::new(WindowNamedGetter { name }),
+        );
+        unsafe {
+            Some(NonNull::new_unchecked(
+                collection.reflector().get_jsobject().get(),
+            ))
+        }
+    }
+
+    // https://html.spec.whatwg.org/multipage/#dom-tree-accessors:supported-property-names
+    fn SupportedPropertyNames(&self) -> Vec<DOMString> {
+        let mut names_with_first_named_element_map: HashMap<&Atom, &Element> = HashMap::new();
+
+        let document = self.Document();
+        let name_map = document.name_map();
+        for (name, elements) in &(*name_map).0 {
+            if name.is_empty() {
+                continue;
+            }
+            let mut name_iter = elements
+                .iter()
+                .filter(|elem| is_named_element_with_name_attribute(elem));
+            if let Some(first) = name_iter.next() {
+                names_with_first_named_element_map.insert(name, first);
+            }
+        }
+        let id_map = document.id_map();
+        for (id, elements) in &(*id_map).0 {
+            if id.is_empty() {
+                continue;
+            }
+            let mut id_iter = elements
+                .iter()
+                .filter(|elem| is_named_element_with_id_attribute(elem));
+            if let Some(first) = id_iter.next() {
+                match names_with_first_named_element_map.entry(id) {
+                    Entry::Vacant(entry) => drop(entry.insert(first)),
+                    Entry::Occupied(mut entry) => {
+                        if first.upcast::<Node>().is_before(entry.get().upcast()) {
+                            *entry.get_mut() = first;
+                        }
+                    },
+                }
+            }
+        }
+
+        let mut names_with_first_named_element_vec: Vec<(&Atom, &Element)> =
+            names_with_first_named_element_map
+                .iter()
+                .map(|(k, v)| (*k, *v))
+                .collect();
+        names_with_first_named_element_vec.sort_unstable_by(|a, b| {
+            if a.1 == b.1 {
+                // This can happen if an img has an id different from its name,
+                // spec does not say which string to put first.
+                a.0.cmp(&b.0)
+            } else if a.1.upcast::<Node>().is_before(b.1.upcast::<Node>()) {
+                cmp::Ordering::Less
+            } else {
+                cmp::Ordering::Greater
+            }
+        });
+
+        names_with_first_named_element_vec
+            .iter()
+            .map(|(k, _v)| DOMString::from(&***k))
+            .collect()
+    }
 }
 
 impl Window {
+    // https://heycam.github.io/webidl/#named-properties-object
+    // https://html.spec.whatwg.org/multipage/#named-access-on-the-window-object
+    #[allow(unsafe_code)]
+    pub fn create_named_properties_object(
+        cx: JSContext,
+        proto: HandleObject,
+        object: MutableHandleObject,
+    ) {
+        window_named_properties::create(cx, proto, object)
+    }
+
     pub(crate) fn set_current_event(&self, event: Option<&Event>) -> Option<DomRoot<Event>> {
         let current = self
             .current_event
@@ -1519,28 +1711,19 @@ impl Window {
 
         // TODO Step 4 - determine if a window has a viewport
 
-        // Step 5
-        //TODO remove scrollbar width
-        let width = self.InnerWidth() as f64;
-        // Step 6
-        //TODO remove scrollbar height
-        let height = self.InnerHeight() as f64;
+        // Step 5 & 6
+        // TODO: Remove scrollbar dimensions.
+        let viewport = self.window_size.get().initial_viewport;
 
         // Step 7 & 8
-        //TODO use overflow direction
-        let body = self.Document().GetBody();
-        let (x, y) = match body {
-            Some(e) => {
-                let content_size = e.upcast::<Node>().bounding_content_box_or_zero();
-                let content_height = content_size.size.height.to_f64_px();
-                let content_width = content_size.size.width.to_f64_px();
-                (
-                    xfinite.min(content_width - width).max(0.0f64),
-                    yfinite.min(content_height - height).max(0.0f64),
-                )
-            },
-            None => (xfinite.max(0.0f64), yfinite.max(0.0f64)),
-        };
+        // TODO: Consider `block-end` and `inline-end` overflow direction.
+        let scrolling_area = self.scrolling_area_query(None);
+        let x = xfinite
+            .min(scrolling_area.width() as f64 - viewport.width as f64)
+            .max(0.0f64);
+        let y = yfinite
+            .min(scrolling_area.height() as f64 - viewport.height as f64)
+            .max(0.0f64);
 
         // Step 10
         //TODO handling ongoing smooth scrolling
@@ -1551,14 +1734,13 @@ impl Window {
         //TODO Step 11
         //let document = self.Document();
         // Step 12
-        let global_scope = self.upcast::<GlobalScope>();
         let x = x.to_f32().unwrap_or(0.0f32);
         let y = y.to_f32().unwrap_or(0.0f32);
         self.update_viewport_for_scroll(x, y);
         self.perform_a_scroll(
             x,
             y,
-            global_scope.pipeline_id().root_scroll_id(),
+            self.upcast::<GlobalScope>().pipeline_id().root_scroll_id(),
             behavior,
             None,
         );
@@ -1576,15 +1758,13 @@ impl Window {
         // TODO Step 1
         // TODO(mrobinson, #18709): Add smooth scrolling support to WebRender so that we can
         // properly process ScrollBehavior here.
-        match self.layout_chan() {
-            Some(chan) => chan
-                .send(Msg::UpdateScrollStateFromScript(ScrollState {
-                    scroll_id,
-                    scroll_offset: Vector2D::new(-x, -y),
-                }))
-                .unwrap(),
-            None => warn!("Layout channel unavailable"),
-        }
+        self.reflow(
+            ReflowGoal::UpdateScrollNode(ScrollState {
+                scroll_id,
+                scroll_offset: Vector2D::new(-x, -y),
+            }),
+            ReflowReason::ScrollFromScript,
+        );
     }
 
     pub fn update_viewport_for_scroll(&self, x: f32, y: f32) {
@@ -1916,11 +2096,14 @@ impl Window {
         self.layout_rpc.node_geometry().client_rect
     }
 
-    pub fn scroll_area_query(&self, node: &Node) -> UntypedRect<i32> {
-        if !self.layout_reflow(QueryMsg::NodeScrollGeometryQuery(node.to_opaque())) {
+    /// Find the scroll area of the given node, if it is not None. If the node
+    /// is None, find the scroll area of the viewport.
+    pub fn scrolling_area_query(&self, node: Option<&Node>) -> UntypedRect<i32> {
+        let opaque = node.map(|node| node.to_opaque());
+        if !self.layout_reflow(QueryMsg::ScrollingAreaQuery(opaque)) {
             return Rect::zero();
         }
-        self.layout_rpc.node_scroll_area().client_rect
+        self.layout_rpc.scrolling_area().client_rect
     }
 
     pub fn scroll_offset_query(&self, node: &Node) -> Vector2D<f32, LayoutPixel> {
@@ -2376,7 +2559,6 @@ impl Window {
         replace_surrogates: bool,
         user_agent: Cow<'static, str>,
         player_context: WindowGLContext,
-        event_loop_waker: Option<Box<dyn EventLoopWaker>>,
         gpu_id_hub: Arc<ParkMutex<Identities>>,
         inherited_secure_context: Option<bool>,
     ) -> DomRoot<Self> {
@@ -2462,7 +2644,6 @@ impl Window {
             userscripts_path,
             replace_surrogates,
             player_context,
-            event_loop_waker,
             visible: Cell::new(true),
             layout_marker: DomRefCell::new(Rc::new(Cell::new(true))),
             current_event: DomRefCell::new(None),
@@ -2478,7 +2659,7 @@ impl Window {
     /// Create a new cached instance of the given value.
     pub fn cache_layout_value<T>(&self, value: T) -> LayoutValue<T>
     where
-        T: Copy + JSTraceable + MallocSizeOf,
+        T: Copy + MallocSizeOf,
     {
         LayoutValue::new(self.layout_marker.borrow().clone(), value)
     }
@@ -2488,14 +2669,21 @@ impl Window {
 /// value can only be read as long as the associated layout marker that is considered
 /// valid. It will automatically become unavailable when the next layout operation is
 /// performed.
-#[derive(JSTraceable, MallocSizeOf)]
-pub struct LayoutValue<T: JSTraceable + MallocSizeOf> {
+#[derive(MallocSizeOf)]
+pub struct LayoutValue<T: MallocSizeOf> {
     #[ignore_malloc_size_of = "Rc is hard"]
     is_valid: Rc<Cell<bool>>,
     value: T,
 }
 
-impl<T: Copy + JSTraceable + MallocSizeOf> LayoutValue<T> {
+#[allow(unsafe_code)]
+unsafe impl<T: JSTraceable + MallocSizeOf> JSTraceable for LayoutValue<T> {
+    unsafe fn trace(&self, trc: *mut js::jsapi::JSTracer) {
+        self.value.trace(trc)
+    }
+}
+
+impl<T: Copy + MallocSizeOf> LayoutValue<T> {
     fn new(marker: Rc<Cell<bool>>, value: T) -> Self {
         LayoutValue {
             is_valid: marker,
@@ -2540,12 +2728,13 @@ fn debug_reflow_events(id: PipelineId, reflow_goal: &ReflowGoal, reason: &Reflow
     let goal_string = match *reflow_goal {
         ReflowGoal::Full => "\tFull",
         ReflowGoal::TickAnimations => "\tTickAnimations",
+        ReflowGoal::UpdateScrollNode(_) => "\tUpdateScrollNode",
         ReflowGoal::LayoutQuery(ref query_msg, _) => match query_msg {
             &QueryMsg::ContentBoxQuery(_n) => "\tContentBoxQuery",
             &QueryMsg::ContentBoxesQuery(_n) => "\tContentBoxesQuery",
             &QueryMsg::NodesFromPointQuery(..) => "\tNodesFromPointQuery",
             &QueryMsg::ClientRectQuery(_n) => "\tClientRectQuery",
-            &QueryMsg::NodeScrollGeometryQuery(_n) => "\tNodeScrollGeometryQuery",
+            &QueryMsg::ScrollingAreaQuery(_n) => "\tNodeScrollGeometryQuery",
             &QueryMsg::NodeScrollIdQuery(_n) => "\tNodeScrollIdQuery",
             &QueryMsg::ResolvedStyleQuery(_, _, _) => "\tResolvedStyleQuery",
             &QueryMsg::ResolvedFontStyleQuery(..) => "\nResolvedFontStyleQuery",
@@ -2658,4 +2847,22 @@ impl ParseErrorReporter for CSSErrorReporter {
                 error.to_string(),
             ));
     }
+}
+
+fn is_named_element_with_name_attribute(elem: &Element) -> bool {
+    let type_ = match elem.upcast::<Node>().type_id() {
+        NodeTypeId::Element(ElementTypeId::HTMLElement(type_)) => type_,
+        _ => return false,
+    };
+    match type_ {
+        HTMLElementTypeId::HTMLEmbedElement |
+        HTMLElementTypeId::HTMLFormElement |
+        HTMLElementTypeId::HTMLImageElement |
+        HTMLElementTypeId::HTMLObjectElement => true,
+        _ => false,
+    }
+}
+
+fn is_named_element_with_id_attribute(elem: &Element) -> bool {
+    elem.is_html_element()
 }

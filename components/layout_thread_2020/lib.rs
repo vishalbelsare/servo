@@ -8,24 +8,19 @@
 //! The layout thread. Performs layout on the DOM, builds display lists and sends them to be
 //! painted.
 
-#[macro_use]
-extern crate crossbeam_channel;
-#[macro_use]
-extern crate html5ever;
-#[macro_use]
-extern crate lazy_static;
-#[macro_use]
-extern crate log;
-#[macro_use]
-extern crate profile_traits;
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
+use std::ops::{Deref, DerefMut};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
+use std::{process, thread};
 
-mod dom_wrapper;
-
-use crate::dom_wrapper::{ServoLayoutDocument, ServoLayoutElement, ServoLayoutNode};
 use app_units::Au;
-use crossbeam_channel::{Receiver, Sender};
+use crossbeam_channel::{select, Receiver, Sender};
 use embedder_traits::resources::{self, Resource};
-use euclid::{default::Size2D as UntypedSize2D, Point2D, Rect, Scale, Size2D};
+use euclid::default::Size2D as UntypedSize2D;
+use euclid::{Point2D, Rect, Scale, Size2D};
 use fnv::FnvHashMap;
 use fxhash::FxHashMap;
 use gfx::font_cache_thread::FontCacheThread;
@@ -34,58 +29,53 @@ use gfx_traits::{node_id_from_scroll_id, Epoch};
 use ipc_channel::ipc::{self, IpcReceiver, IpcSender};
 use ipc_channel::router::ROUTER;
 use layout::context::LayoutContext;
-use layout::display_list::{DisplayListBuilder, WebRenderImageInfo};
-use layout::layout_debug;
+use layout::display_list::{DisplayList, WebRenderImageInfo};
+use layout::dom::DOMLayoutData;
 use layout::query::{
-    process_content_box_request, process_content_boxes_request, process_resolved_font_style_query,
-    LayoutRPCImpl, LayoutThreadData,
-};
-use layout::query::{process_element_inner_text_query, process_node_geometry_request};
-use layout::query::{process_node_scroll_area_request, process_node_scroll_id_request};
-use layout::query::{
-    process_offset_parent_query, process_resolved_style_request, process_text_index_request,
+    process_content_box_request, process_content_boxes_request, process_element_inner_text_query,
+    process_node_geometry_request, process_node_scroll_area_request,
+    process_node_scroll_id_request, process_offset_parent_query, process_resolved_font_style_query,
+    process_resolved_style_request, process_text_index_request, LayoutRPCImpl, LayoutThreadData,
 };
 use layout::traversal::RecalcStyle;
-use layout::{BoxTree, FragmentTree};
+use layout::{layout_debug, BoxTree, FragmentTree};
 use layout_traits::LayoutThreadFactory;
-use libc::c_void;
+use lazy_static::lazy_static;
+use log::{debug, error, warn};
 use malloc_size_of::{MallocSizeOf, MallocSizeOfOps};
 use metrics::{PaintTimeMetrics, ProfilerMetadataFactory, ProgressiveWebMetric};
 use msg::constellation_msg::{
-    BackgroundHangMonitor, BackgroundHangMonitorRegister, HangAnnotation,
+    BackgroundHangMonitor, BackgroundHangMonitorRegister, BrowsingContextId, HangAnnotation,
+    LayoutHangAnnotation, MonitoredComponentId, MonitoredComponentType, PipelineId,
+    TopLevelBrowsingContextId,
 };
-use msg::constellation_msg::{LayoutHangAnnotation, MonitoredComponentType, PipelineId};
-use msg::constellation_msg::{MonitoredComponentId, TopLevelBrowsingContextId};
 use net_traits::image_cache::{ImageCache, UsePlaceholder};
 use parking_lot::RwLock;
 use profile_traits::mem::{self as profile_mem, Report, ReportKind, ReportsChan};
-use profile_traits::time::{self as profile_time, profile, TimerMetadata};
-use profile_traits::time::{TimerMetadataFrameType, TimerMetadataReflowType};
-use script_layout_interface::message::{LayoutThreadInit, Msg, NodesFromPointQueryType};
-use script_layout_interface::message::{QueryMsg, ReflowComplete, ReflowGoal, ScriptReflow};
-use script_layout_interface::rpc::TextIndexResponse;
-use script_layout_interface::rpc::{LayoutRPC, OffsetParentResponse};
-use script_traits::{ConstellationControlMsg, LayoutControlMsg, LayoutMsg as ConstellationMsg};
-use script_traits::{DrawAPaintImageResult, PaintWorkletError};
-use script_traits::{Painter, WebrenderIpcSender};
-use script_traits::{ScrollState, UntrustedNodeAddress, WindowSizeData};
+use profile_traits::path;
+use profile_traits::time::{
+    self as profile_time, profile, TimerMetadata, TimerMetadataFrameType, TimerMetadataReflowType,
+};
+use script::layout_dom::{ServoLayoutDocument, ServoLayoutElement, ServoLayoutNode};
+use script_layout_interface::message::{
+    LayoutThreadInit, Msg, NodesFromPointQueryType, QueryMsg, ReflowComplete, ReflowGoal,
+    ScriptReflow,
+};
+use script_layout_interface::rpc::{LayoutRPC, OffsetParentResponse, TextIndexResponse};
+use script_traits::{
+    ConstellationControlMsg, DrawAPaintImageResult, IFrameSizeMsg, LayoutControlMsg,
+    LayoutMsg as ConstellationMsg, PaintWorkletError, Painter, ScrollState, UntrustedNodeAddress,
+    WebrenderIpcSender, WindowSizeData, WindowSizeType,
+};
 use servo_arc::Arc as ServoArc;
 use servo_atoms::Atom;
-use servo_config::opts;
+use servo_config::opts::{self, DebugOptions};
 use servo_url::{ImmutableOrigin, ServoUrl};
-use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
-use std::ops::{Deref, DerefMut};
-use std::process;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
-use std::thread;
-use std::time::Duration;
 use style::animation::DocumentAnimationSet;
 use style::context::{
     QuirksMode, RegisteredSpeculativePainter, RegisteredSpeculativePainters, SharedStyleContext,
 };
-use style::dom::{TDocument, TElement, TNode};
+use style::dom::{TElement, TNode};
 use style::driver;
 use style::error_reporting::RustLogReporter;
 use style::global_style_data::{GLOBAL_STYLE_DATA, STYLE_THREAD_POOL};
@@ -100,9 +90,8 @@ use style::stylist::Stylist;
 use style::thread_state::{self, ThreadState};
 use style::traversal::DomTraversal;
 use style::traversal_flags::TraversalFlags;
-use style_traits::CSSPixel;
-use style_traits::DevicePixel;
-use style_traits::SpeculativePainter;
+use style_traits::{CSSPixel, DevicePixel, SpeculativePainter};
+use webrender_api::{units, HitTestFlags};
 
 /// Information needed by the layout thread.
 pub struct LayoutThread {
@@ -135,6 +124,9 @@ pub struct LayoutThread {
 
     /// A means of communication with the background hang monitor.
     background_hang_monitor: Box<dyn BackgroundHangMonitor>,
+
+    /// The channel on which messages can be sent to the constellation.
+    constellation_chan: IpcSender<ConstellationMsg>,
 
     /// The channel on which messages can be sent to the script thread.
     script_chan: IpcSender<ConstellationControlMsg>,
@@ -191,33 +183,15 @@ pub struct LayoutThread {
     /// Paint time metrics.
     paint_time_metrics: PaintTimeMetrics,
 
+    /// The sizes of all iframes encountered during the last layout operation.
+    last_iframe_sizes: RefCell<FnvHashMap<BrowsingContextId, Size2D<f32, CSSPixel>>>,
+
     /// Flag that indicates if LayoutThread is busy handling a request.
     busy: Arc<AtomicBool>,
 
-    /// Load web fonts synchronously to avoid non-deterministic network-driven reflows.
-    load_webfonts_synchronously: bool,
-
-    /// Dumps the display list form after a layout.
-    dump_display_list: bool,
-
-    /// Dumps the display list in JSON form after a layout.
-    dump_display_list_json: bool,
-
-    /// Dumps the DOM after restyle.
-    dump_style_tree: bool,
-
-    /// Dumps the flow tree after a layout.
-    dump_rule_tree: bool,
-
-    /// Dumps the flow tree after a layout.
-    dump_flow_tree: bool,
-
-    /// Emits notifications when there is a relayout.
-    relayout_event: bool,
-
-    /// True if each step of layout is traced to an external JSON file
-    /// for debugging purposes.
-    trace_layout: bool,
+    /// Debug options, copied from configuration to this `LayoutThread` in order
+    /// to avoid having to constantly access the thread-safe global options.
+    debug: DebugOptions,
 }
 
 impl LayoutThreadFactory for LayoutThread {
@@ -241,16 +215,7 @@ impl LayoutThreadFactory for LayoutThread {
         webrender_api_sender: WebrenderIpcSender,
         paint_time_metrics: PaintTimeMetrics,
         busy: Arc<AtomicBool>,
-        load_webfonts_synchronously: bool,
         window_size: WindowSizeData,
-        dump_display_list: bool,
-        dump_display_list_json: bool,
-        dump_style_tree: bool,
-        dump_rule_tree: bool,
-        relayout_event: bool,
-        _nonincremental_layout: bool,
-        trace_layout: bool,
-        dump_flow_tree: bool,
     ) {
         thread::Builder::new()
             .name(format!("Layout{}", id))
@@ -289,15 +254,7 @@ impl LayoutThreadFactory for LayoutThread {
                         webrender_api_sender,
                         paint_time_metrics,
                         busy,
-                        load_webfonts_synchronously,
                         window_size,
-                        relayout_event,
-                        dump_display_list,
-                        dump_display_list_json,
-                        dump_style_tree,
-                        dump_rule_tree,
-                        dump_flow_tree,
-                        trace_layout,
                     );
 
                     let reporter_name = format!("layout-reporter-{}", id);
@@ -457,15 +414,7 @@ impl LayoutThread {
         webrender_api_sender: WebrenderIpcSender,
         paint_time_metrics: PaintTimeMetrics,
         busy: Arc<AtomicBool>,
-        load_webfonts_synchronously: bool,
         window_size: WindowSizeData,
-        relayout_event: bool,
-        dump_display_list: bool,
-        dump_display_list_json: bool,
-        dump_style_tree: bool,
-        dump_rule_tree: bool,
-        dump_flow_tree: bool,
-        trace_layout: bool,
     ) -> LayoutThread {
         // Let webrender know about this pipeline by sending an empty display list.
         webrender_api_sender.send_initial_transaction(id.to_webrender());
@@ -488,21 +437,22 @@ impl LayoutThread {
             ROUTER.route_ipc_receiver_to_new_crossbeam_receiver(ipc_font_cache_receiver);
 
         LayoutThread {
-            id: id,
+            id,
             top_level_browsing_context_id: top_level_browsing_context_id,
-            url: url,
-            is_iframe: is_iframe,
-            port: port,
+            url,
+            is_iframe,
+            port,
             pipeline_port: pipeline_receiver,
+            constellation_chan,
             script_chan: script_chan.clone(),
             background_hang_monitor,
-            time_profiler_chan: time_profiler_chan,
-            mem_profiler_chan: mem_profiler_chan,
+            time_profiler_chan,
+            mem_profiler_chan,
             registered_painters: RegisteredPaintersImpl(Default::default()),
             image_cache,
-            font_cache_thread: font_cache_thread,
+            font_cache_thread,
             first_reflow: Cell::new(true),
-            font_cache_receiver: font_cache_receiver,
+            font_cache_receiver,
             font_cache_sender: ipc_font_cache_sender,
             generation: Cell::new(0),
             outstanding_web_fonts: Arc::new(AtomicUsize::new(0)),
@@ -514,13 +464,12 @@ impl LayoutThread {
             webrender_api: webrender_api_sender,
             stylist: Stylist::new(device, QuirksMode::NoQuirks),
             rw_data: Arc::new(Mutex::new(LayoutThreadData {
-                constellation_chan: constellation_chan,
                 display_list: None,
                 content_box_response: None,
                 content_boxes_response: Vec::new(),
                 client_rect_response: Rect::zero(),
                 scroll_id_response: None,
-                scroll_area_response: Rect::zero(),
+                scrolling_area_response: Rect::zero(),
                 resolved_style_response: String::new(),
                 resolved_font_style_response: None,
                 offset_parent_response: OffsetParentResponse::empty(),
@@ -532,15 +481,9 @@ impl LayoutThread {
             })),
             webrender_image_cache: Default::default(),
             paint_time_metrics: paint_time_metrics,
+            last_iframe_sizes: Default::default(),
             busy,
-            load_webfonts_synchronously,
-            relayout_event,
-            dump_display_list,
-            dump_display_list_json,
-            dump_style_tree,
-            dump_rule_tree,
-            dump_flow_tree,
-            trace_layout,
+            debug: opts::get().debug.clone(),
         }
     }
 
@@ -566,6 +509,7 @@ impl LayoutThread {
         animation_timeline_value: f64,
         animations: &DocumentAnimationSet,
         stylesheets_changed: bool,
+        use_rayon: bool,
     ) -> LayoutContext<'a> {
         let traversal_flags = match stylesheets_changed {
             true => TraversalFlags::ForCSSRuleChanges,
@@ -590,7 +534,7 @@ impl LayoutThread {
             font_cache_thread: Mutex::new(self.font_cache_thread.clone()),
             webrender_image_cache: self.webrender_image_cache.clone(),
             pending_images: Mutex::new(vec![]),
-            use_rayon: STYLE_THREAD_POOL.pool().is_some(),
+            use_rayon,
         }
     }
 
@@ -609,9 +553,6 @@ impl LayoutThread {
             Msg::CreateLayoutThread(..) => LayoutHangAnnotation::CreateLayoutThread,
             Msg::SetFinalUrl(..) => LayoutHangAnnotation::SetFinalUrl,
             Msg::SetScrollStates(..) => LayoutHangAnnotation::SetScrollStates,
-            Msg::UpdateScrollStateFromScript(..) => {
-                LayoutHangAnnotation::UpdateScrollStateFromScript
-            },
             Msg::RegisterPaint(..) => LayoutHangAnnotation::RegisterPaint,
             Msg::SetNavigationStart(..) => LayoutHangAnnotation::SetNavigationStart,
         };
@@ -717,19 +658,6 @@ impl LayoutThread {
             Msg::SetScrollStates(new_scroll_states) => {
                 self.set_scroll_states(new_scroll_states, possibly_locked_rw_data);
             },
-            Msg::UpdateScrollStateFromScript(state) => {
-                let mut rw_data = possibly_locked_rw_data.lock();
-                rw_data
-                    .scroll_offsets
-                    .insert(state.scroll_id, state.scroll_offset);
-
-                let point = Point2D::new(-state.scroll_offset.x, -state.scroll_offset.y);
-                self.webrender_api.send_scroll_node(
-                    webrender_api::units::LayoutPoint::from_untyped(point),
-                    state.scroll_id,
-                    webrender_api::ScrollClamping::ToContentBounds,
-                );
-            },
             Msg::CollectReports(reports_chan) => {
                 self.collect_reports(reports_chan, possibly_locked_rw_data);
             },
@@ -812,16 +740,7 @@ impl LayoutThread {
             self.webrender_api.clone(),
             info.paint_time_metrics,
             info.layout_is_busy,
-            self.load_webfonts_synchronously,
             info.window_size,
-            self.dump_display_list,
-            self.dump_display_list_json,
-            self.dump_style_tree,
-            self.dump_rule_tree,
-            self.relayout_event,
-            true,                // nonincremental_layout
-            self.trace_layout,   // trace_layout
-            self.dump_flow_tree, // dump_flow_tree
         );
     }
 
@@ -859,7 +778,7 @@ impl LayoutThread {
                 &self.font_cache_thread,
                 &self.font_cache_sender,
                 &self.outstanding_web_fonts,
-                self.load_webfonts_synchronously,
+                self.debug.load_webfonts_synchronously,
             );
         }
     }
@@ -875,7 +794,7 @@ impl LayoutThread {
         data: &mut ScriptReflowResult,
         possibly_locked_rw_data: &mut RwData<'a, 'b>,
     ) {
-        let document = unsafe { ServoLayoutNode::new(&data.document) };
+        let document = unsafe { ServoLayoutNode::<DOMLayoutData>::new(&data.document) };
         let document = document.as_document().unwrap();
 
         let mut rw_data = possibly_locked_rw_data.lock();
@@ -898,8 +817,8 @@ impl LayoutThread {
                         &QueryMsg::ClientRectQuery(_) => {
                             rw_data.client_rect_response = Rect::zero();
                         },
-                        &QueryMsg::NodeScrollGeometryQuery(_) => {
-                            rw_data.scroll_area_response = Rect::zero();
+                        &QueryMsg::ScrollingAreaQuery(_) => {
+                            rw_data.scrolling_area_response = Rect::zero();
                         },
                         &QueryMsg::NodeScrollIdQuery(_) => {
                             rw_data.scroll_id_response = None;
@@ -920,11 +839,17 @@ impl LayoutThread {
                         &QueryMsg::ElementInnerTextQuery(_) => {
                             rw_data.element_inner_text_response = String::new();
                         },
-                        &QueryMsg::InnerWindowDimensionsQuery(_) => {
-                            rw_data.inner_window_dimensions_response = None;
+                        &QueryMsg::InnerWindowDimensionsQuery(browsing_context_id) => {
+                            rw_data.inner_window_dimensions_response = self
+                                .last_iframe_sizes
+                                .borrow()
+                                .get(&browsing_context_id)
+                                .cloned();
                         },
                     },
-                    ReflowGoal::Full | ReflowGoal::TickAnimations => {},
+                    ReflowGoal::Full |
+                    ReflowGoal::TickAnimations |
+                    ReflowGoal::UpdateScrollNode(_) => {},
                 }
                 return;
             },
@@ -933,7 +858,6 @@ impl LayoutThread {
 
         let initial_viewport = data.window_size.initial_viewport;
         let device_pixel_ratio = data.window_size.device_pixel_ratio;
-        let old_viewport_size = self.viewport_size;
         let current_screen_size = Size2D::new(
             Au::from_f32_px(initial_viewport.width),
             Au::from_f32_px(initial_viewport.height),
@@ -963,30 +887,7 @@ impl LayoutThread {
 
         self.stylist
             .force_stylesheet_origins_dirty(sheet_origins_affected_by_device_change);
-        self.viewport_size =
-            self.stylist
-                .viewport_constraints()
-                .map_or(current_screen_size, |constraints| {
-                    Size2D::new(
-                        Au::from_f32_px(constraints.size.width),
-                        Au::from_f32_px(constraints.size.height),
-                    )
-                });
-
-        let viewport_size_changed = self.viewport_size != old_viewport_size;
-        if viewport_size_changed {
-            if let Some(constraints) = self.stylist.viewport_constraints() {
-                // let the constellation know about the viewport constraints
-                rw_data
-                    .constellation_chan
-                    .send(ConstellationMsg::ViewportConstrained(
-                        self.id,
-                        constraints.clone(),
-                    ))
-                    .unwrap();
-            }
-        }
-
+        self.viewport_size = current_screen_size;
         if self.first_reflow.get() {
             for stylesheet in &ua_stylesheets.user_or_user_agent_stylesheets {
                 self.stylist
@@ -1012,11 +913,7 @@ impl LayoutThread {
         }
 
         // Flush shadow roots stylesheets if dirty.
-        document.flush_shadow_roots_stylesheets(
-            &self.stylist.device(),
-            document.quirks_mode(),
-            guards.author.clone(),
-        );
+        document.flush_shadow_roots_stylesheets(&mut self.stylist, guards.author.clone());
 
         let restyles = std::mem::take(&mut data.pending_restyles);
         debug!("Draining restyles: {}", restyles.len());
@@ -1025,11 +922,19 @@ impl LayoutThread {
         let elements_with_snapshot: Vec<_> = restyles
             .iter()
             .filter(|r| r.1.snapshot.is_some())
-            .map(|r| unsafe { ServoLayoutNode::new(&r.0).as_element().unwrap() })
+            .map(|r| unsafe {
+                ServoLayoutNode::<DOMLayoutData>::new(&r.0)
+                    .as_element()
+                    .unwrap()
+            })
             .collect();
 
         for (el, restyle) in restyles {
-            let el = unsafe { ServoLayoutNode::new(&el).as_element().unwrap() };
+            let el = unsafe {
+                ServoLayoutNode::<DOMLayoutData>::new(&el)
+                    .as_element()
+                    .unwrap()
+            };
 
             // If we haven't styled this node yet, we don't need to track a
             // restyle.
@@ -1054,6 +959,10 @@ impl LayoutThread {
 
         self.stylist.flush(&guards, Some(root_element), Some(&map));
 
+        let rayon_pool = STYLE_THREAD_POOL.lock().unwrap();
+        let rayon_pool = rayon_pool.pool();
+        let rayon_pool = rayon_pool.as_ref();
+
         // Create a layout context for use throughout the following passes.
         let mut layout_context = self.build_layout_context(
             guards.clone(),
@@ -1062,25 +971,25 @@ impl LayoutThread {
             data.animation_timeline_value,
             &data.animations,
             data.stylesheets_changed,
+            rayon_pool.is_some(),
         );
 
         let dirty_root = unsafe {
-            ServoLayoutNode::new(&data.dirty_root.unwrap())
+            ServoLayoutNode::<DOMLayoutData>::new(&data.dirty_root.unwrap())
                 .as_element()
                 .unwrap()
         };
 
         let traversal = RecalcStyle::new(layout_context);
         let token = {
-            let shared = DomTraversal::<ServoLayoutElement>::shared_context(&traversal);
+            let shared =
+                DomTraversal::<ServoLayoutElement<DOMLayoutData>>::shared_context(&traversal);
             RecalcStyle::pre_traverse(dirty_root, shared)
         };
 
-        let rayon_pool = STYLE_THREAD_POOL.pool();
-        let rayon_pool = rayon_pool.as_ref();
-
         if token.should_traverse() {
-            let dirty_root = driver::traverse_dom(&traversal, token, rayon_pool).as_node();
+            let dirty_root: ServoLayoutNode<DOMLayoutData> =
+                driver::traverse_dom(&traversal, token, rayon_pool).as_node();
 
             let root_node = root_element.as_node();
             let mut box_tree = self.box_tree.borrow_mut();
@@ -1120,14 +1029,14 @@ impl LayoutThread {
             unsafe { element.unset_snapshot_flags() }
         }
 
-        if self.dump_style_tree {
+        if self.debug.dump_style_tree {
             println!(
                 "{:?}",
                 style::dom::ShowSubtreeDataAndPrimaryValues(root_element.as_node())
             );
         }
 
-        if self.dump_rule_tree {
+        if self.debug.dump_rule_tree {
             layout_context
                 .style_context
                 .stylist
@@ -1187,16 +1096,17 @@ impl LayoutThread {
                     rw_data.client_rect_response =
                         process_node_geometry_request(node, self.fragment_tree.borrow().clone());
                 },
-                &QueryMsg::NodeScrollGeometryQuery(node) => {
-                    rw_data.scroll_area_response = process_node_scroll_area_request(node);
+                &QueryMsg::ScrollingAreaQuery(node) => {
+                    rw_data.scrolling_area_response =
+                        process_node_scroll_area_request(node, self.fragment_tree.borrow().clone());
                 },
                 &QueryMsg::NodeScrollIdQuery(node) => {
-                    let node = unsafe { ServoLayoutNode::new(&node) };
+                    let node = unsafe { ServoLayoutNode::<DOMLayoutData>::new(&node) };
                     rw_data.scroll_id_response =
                         Some(process_node_scroll_id_request(self.id, node));
                 },
                 &QueryMsg::ResolvedStyleQuery(node, ref pseudo, ref property) => {
-                    let node = unsafe { ServoLayoutNode::new(&node) };
+                    let node = unsafe { ServoLayoutNode::<DOMLayoutData>::new(&node) };
                     let fragment_tree = self.fragment_tree.borrow().clone();
                     rw_data.resolved_style_response = process_resolved_style_request(
                         context,
@@ -1207,7 +1117,7 @@ impl LayoutThread {
                     );
                 },
                 &QueryMsg::ResolvedFontStyleQuery(node, ref property, ref value) => {
-                    let node = unsafe { ServoLayoutNode::new(&node) };
+                    let node = unsafe { ServoLayoutNode::<DOMLayoutData>::new(&node) };
                     rw_data.resolved_font_style_response =
                         process_resolved_font_style_query(node, property, value);
                 },
@@ -1218,29 +1128,26 @@ impl LayoutThread {
                 &QueryMsg::StyleQuery => {},
                 &QueryMsg::NodesFromPointQuery(client_point, ref reflow_goal) => {
                     let mut flags = match reflow_goal {
-                        &NodesFromPointQueryType::Topmost => webrender_api::HitTestFlags::empty(),
-                        &NodesFromPointQueryType::All => webrender_api::HitTestFlags::FIND_ALL,
+                        &NodesFromPointQueryType::Topmost => HitTestFlags::empty(),
+                        &NodesFromPointQueryType::All => HitTestFlags::FIND_ALL,
                     };
 
                     // The point we get is not relative to the entire WebRender scene, but to this
                     // particular pipeline, so we need to tell WebRender about that.
-                    flags.insert(webrender_api::HitTestFlags::POINT_RELATIVE_TO_PIPELINE_VIEWPORT);
+                    flags.insert(HitTestFlags::POINT_RELATIVE_TO_PIPELINE_VIEWPORT);
 
-                    let client_point = webrender_api::units::WorldPoint::from_untyped(client_point);
+                    let client_point = units::WorldPoint::from_untyped(client_point);
                     let results = self.webrender_api.hit_test(
                         Some(self.id.to_webrender()),
                         client_point,
                         flags,
                     );
 
-                    rw_data.nodes_from_point_response = results
-                        .items
-                        .iter()
-                        .map(|item| UntrustedNodeAddress(item.tag.0 as *const c_void))
-                        .collect()
+                    rw_data.nodes_from_point_response =
+                        results.iter().map(|result| result.node).collect()
                 },
                 &QueryMsg::ElementInnerTextQuery(node) => {
-                    let node = unsafe { ServoLayoutNode::new(&node) };
+                    let node = unsafe { ServoLayoutNode::<DOMLayoutData>::new(&node) };
                     rw_data.element_inner_text_response = process_element_inner_text_query(node);
                 },
                 &QueryMsg::InnerWindowDimensionsQuery(_browsing_context_id) => {
@@ -1249,8 +1156,21 @@ impl LayoutThread {
                     rw_data.inner_window_dimensions_response = None;
                 },
             },
+            ReflowGoal::UpdateScrollNode(scroll_state) => {
+                self.update_scroll_node_state(&scroll_state, rw_data);
+            },
             ReflowGoal::Full | ReflowGoal::TickAnimations => {},
         }
+    }
+
+    fn update_scroll_node_state(&self, state: &ScrollState, rw_data: &mut LayoutThreadData) {
+        rw_data
+            .scroll_offsets
+            .insert(state.scroll_id, state.scroll_offset);
+
+        let point = Point2D::new(-state.scroll_offset.x, -state.scroll_offset.y);
+        self.webrender_api
+            .send_scroll_node(units::LayoutPoint::from_untyped(point), state.scroll_id);
     }
 
     fn set_scroll_states<'a, 'b>(
@@ -1284,7 +1204,7 @@ impl LayoutThread {
         &self,
         fragment_tree: Arc<FragmentTree>,
         reflow_goal: &ReflowGoal,
-        document: Option<&ServoLayoutDocument>,
+        document: Option<&ServoLayoutDocument<DOMLayoutData>>,
         context: &mut LayoutContext,
     ) {
         Self::cancel_animations_for_nodes_not_in_fragment_tree(
@@ -1292,13 +1212,13 @@ impl LayoutThread {
             &fragment_tree,
         );
 
-        if self.trace_layout {
+        if self.debug.trace_layout {
             if let Some(box_tree) = &*self.box_tree.borrow() {
                 layout_debug::begin_trace(box_tree.clone(), fragment_tree.clone());
             }
         }
 
-        if !reflow_goal.needs_display() {
+        if !reflow_goal.needs_display_list() {
             // Defer the paint step until the next ForDisplay.
             //
             // We need to tell the document about this so it doesn't
@@ -1313,42 +1233,61 @@ impl LayoutThread {
             document.will_paint();
         }
 
-        let mut display_list =
-            DisplayListBuilder::new(self.id.to_webrender(), context, &fragment_tree);
+        let mut epoch = self.epoch.get();
+        epoch.next();
+        self.epoch.set(epoch);
+
+        let viewport_size = units::LayoutSize::from_untyped(Size2D::new(
+            self.viewport_size.width.to_f32_px(),
+            self.viewport_size.height.to_f32_px(),
+        ));
+        let mut display_list = DisplayList::new(
+            viewport_size,
+            fragment_tree.scrollable_overflow(),
+            self.id.to_webrender(),
+            epoch.into(),
+        );
 
         // `dump_serialized_display_list` doesn't actually print anything. It sets up
         // the display list for printing the serialized version when `finalize()` is called.
         // We need to call this before adding any display items so that they are printed
         // during `finalize()`.
-        if self.dump_display_list {
+        if self.debug.dump_display_list {
             display_list.wr.dump_serialized_display_list();
         }
 
-        fragment_tree.build_display_list(&mut display_list);
+        // Build the root stacking context. This turns the `FragmentTree` into a
+        // tree of fragments in CSS painting order and also creates all
+        // applicable spatial and clip nodes.
+        let root_stacking_context =
+            display_list.build_stacking_context_tree(&fragment_tree, &self.debug);
 
-        if self.dump_flow_tree {
+        // Build the rest of the display list which inclues all of the WebRender primitives.
+        let (iframe_sizes, is_contentful) =
+            display_list.build(context, &fragment_tree, &root_stacking_context);
+
+        if self.debug.dump_flow_tree {
             fragment_tree.print();
         }
+        if self.debug.dump_stacking_context_tree {
+            root_stacking_context.debug_print();
+        }
         debug!("Layout done!");
-
-        let mut epoch = self.epoch.get();
-        epoch.next();
-        self.epoch.set(epoch);
 
         // Observe notifications about rendered frames if needed right before
         // sending the display list to WebRender in order to set time related
         // Progressive Web Metrics.
         self.paint_time_metrics
-            .maybe_observe_paint_time(self, epoch, display_list.is_contentful);
+            .maybe_observe_paint_time(self, epoch, is_contentful);
 
-        let viewport_size = webrender_api::units::LayoutSize::from_untyped(Size2D::new(
-            self.viewport_size.width.to_f32_px(),
-            self.viewport_size.height.to_f32_px(),
-        ));
-        self.webrender_api
-            .send_display_list(epoch, viewport_size, display_list.wr.finalize());
+        if reflow_goal.needs_display() {
+            self.webrender_api
+                .send_display_list(display_list.compositor_info, display_list.wr.finalize().1);
+        }
 
-        if self.trace_layout {
+        self.update_iframe_sizes(iframe_sizes);
+
+        if self.debug.trace_layout {
             layout_debug::end_trace(self.generation.get());
         }
 
@@ -1388,6 +1327,49 @@ impl LayoutThread {
         for node in &invalid_nodes {
             if let Some(state) = animations.get_mut(node) {
                 state.cancel_all_animations();
+            }
+        }
+    }
+
+    /// Update the recorded iframe sizes of the contents of this layout thread and
+    /// when these sizes changes, send a message to the constellation informing it
+    /// of the new sizes.
+    fn update_iframe_sizes(
+        &self,
+        new_iframe_sizes: FnvHashMap<BrowsingContextId, Size2D<f32, CSSPixel>>,
+    ) {
+        let old_iframe_sizes =
+            std::mem::replace(&mut *self.last_iframe_sizes.borrow_mut(), new_iframe_sizes);
+
+        if self.last_iframe_sizes.borrow().is_empty() {
+            return;
+        }
+
+        let size_messages: Vec<_> = self
+            .last_iframe_sizes
+            .borrow()
+            .iter()
+            .filter_map(|(browsing_context_id, size)| {
+                match old_iframe_sizes.get(&browsing_context_id) {
+                    Some(old_size) if old_size != size => Some(IFrameSizeMsg {
+                        browsing_context_id: *browsing_context_id,
+                        size: *size,
+                        type_: WindowSizeType::Resize,
+                    }),
+                    None => Some(IFrameSizeMsg {
+                        browsing_context_id: *browsing_context_id,
+                        size: *size,
+                        type_: WindowSizeType::Initial,
+                    }),
+                    _ => None,
+                }
+            })
+            .collect();
+
+        if !size_messages.is_empty() {
+            let msg = ConstellationMsg::IFrameSizes(size_messages);
+            if let Err(e) = self.constellation_chan.send(msg) {
+                warn!("Layout resize to constellation failed ({}).", e);
             }
         }
     }

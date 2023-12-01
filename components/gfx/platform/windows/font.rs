@@ -6,25 +6,26 @@
 // information for an approach that we'll likely need to take when the
 // renderer moves to a sandboxed process.
 
-use crate::font::{FontHandleMethods, FontMetrics, FontTableMethods};
-use crate::font::{FontTableTag, FractionalPixel};
+use std::fmt;
+use std::ops::Deref;
+use std::sync::Arc;
+
+use app_units::Au;
+use dwrote::{Font, FontFace, FontFile, FontStretch, FontStyle};
+use log::debug;
+use servo_atoms::Atom;
+use style::computed_values::font_stretch::T as StyleFontStretch;
+use style::computed_values::font_weight::T as StyleFontWeight;
+use style::values::computed::font::FontStyle as StyleFontStyle;
+use style::values::specified::font::FontStretchKeyword;
+
+use crate::font::{
+    FontHandleMethods, FontMetrics, FontTableMethods, FontTableTag, FractionalPixel,
+};
 use crate::platform::font_template::FontTemplateData;
 use crate::platform::windows::font_context::FontContextHandle;
 use crate::platform::windows::font_list::font_from_atom;
 use crate::text::glyph::GlyphId;
-use app_units::Au;
-use dwrote::{Font, FontFace, FontFile};
-use dwrote::{FontStretch, FontStyle};
-use servo_atoms::Atom;
-use std::fmt;
-use std::ops::Deref;
-use std::sync::Arc;
-use style::computed_values::font_stretch::T as StyleFontStretch;
-use style::computed_values::font_weight::T as StyleFontWeight;
-use style::values::computed::font::FontStyle as StyleFontStyle;
-use style::values::generics::font::FontStyle as GenericFontStyle;
-use style::values::generics::NonNegative;
-use style::values::specified::font::FontStretchKeyword;
 
 // 1em = 12pt = 16px, assuming 72 points per inch and 96 px per inch
 fn pt_to_px(pt: f64) -> f64 {
@@ -65,39 +66,6 @@ fn make_tag(tag_bytes: &[u8]) -> FontTableTag {
 
 macro_rules! try_lossy(($result:expr) => ($result.map_err(|_| (()))?));
 
-// Given a set of records, figure out the string indices for the family and face
-// names.  We want name_id 1 and 2, and we need to use platform_id == 1 and
-// language_id == 0 to avoid limitations in the truetype crate.  We *could* just
-// do our own parsing here, and use the offset/length data and pull the values out
-// ourselves.
-fn get_family_face_indices(records: &[truetype::naming_table::Record]) -> Option<(usize, usize)> {
-    let mut family_name_index = None;
-    let mut face_name_index = None;
-
-    for i in 0..records.len() {
-        // the truetype crate can only decode mac platform format names
-        if records[i].platform_id != 1 {
-            continue;
-        }
-
-        if records[i].language_id != 0 {
-            continue;
-        }
-
-        if records[i].name_id == 1 {
-            family_name_index = Some(i);
-        } else if records[i].name_id == 2 {
-            face_name_index = Some(i);
-        }
-    }
-
-    if family_name_index.is_some() && face_name_index.is_some() {
-        Some((family_name_index.unwrap(), face_name_index.unwrap()))
-    } else {
-        None
-    }
-}
-
 // We need the font (DWriteFont) in order to be able to query things like
 // the family name, face name, weight, etc.  On Windows 10, the
 // DWriteFontFace3 interface provides this on the FontFace, but that's only
@@ -118,8 +86,11 @@ struct FontInfo {
 impl FontInfo {
     fn new_from_face(face: &FontFace) -> Result<FontInfo, ()> {
         use std::cmp::{max, min};
+        use std::collections::HashMap;
         use std::io::Cursor;
-        use truetype::{NamingTable, Value, WindowsMetrics};
+
+        use truetype::naming_table::{NameID, NamingTable};
+        use truetype::{Value, WindowsMetrics};
 
         let name_table_bytes = face.get_font_table(make_tag(b"name"));
         let os2_table_bytes = face.get_font_table(make_tag(b"OS/2"));
@@ -129,27 +100,23 @@ impl FontInfo {
 
         let mut name_table_cursor = Cursor::new(name_table_bytes.as_ref().unwrap());
         let names = try_lossy!(NamingTable::read(&mut name_table_cursor));
-        let (family, face) = match names {
-            NamingTable::Format0(ref table) => {
-                if let Some((family_index, face_index)) = get_family_face_indices(&table.records) {
-                    let strings = table.strings().unwrap();
-                    let family = strings[family_index].clone();
-                    let face = strings[face_index].clone();
-                    (family, face)
-                } else {
-                    return Err(());
-                }
-            },
-            NamingTable::Format1(ref table) => {
-                if let Some((family_index, face_index)) = get_family_face_indices(&table.records) {
-                    let strings = table.strings().unwrap();
-                    let family = strings[family_index].clone();
-                    let face = strings[face_index].clone();
-                    (family, face)
-                } else {
-                    return Err(());
-                }
-            },
+        let mut names: HashMap<_, _> = names
+            .iter()
+            .filter(|((_, language_tag), value)| {
+                value.is_some() &&
+                    language_tag
+                        .as_deref()
+                        .map_or(false, |language_tag| language_tag.starts_with("en"))
+            })
+            .map(|((name_id, _), value)| (name_id, value.unwrap()))
+            .collect();
+        let family = match names.remove(&NameID::FontFamilyName) {
+            Some(family) => family,
+            _ => return Err(()),
+        };
+        let face = match names.remove(&NameID::FontSubfamilyName) {
+            Some(face) => face,
+            _ => return Err(()),
         };
 
         let mut os2_table_cursor = Cursor::new(os2_table_bytes.as_ref().unwrap());
@@ -171,28 +138,26 @@ impl FontInfo {
             },
         };
 
-        let weight = StyleFontWeight(weight_val as f32);
+        let weight = StyleFontWeight::from_float(weight_val as f32);
 
-        let stretch = StyleFontStretch(NonNegative(
-            match min(9, max(1, width_val)) {
-                1 => FontStretchKeyword::UltraCondensed,
-                2 => FontStretchKeyword::ExtraCondensed,
-                3 => FontStretchKeyword::Condensed,
-                4 => FontStretchKeyword::SemiCondensed,
-                5 => FontStretchKeyword::Normal,
-                6 => FontStretchKeyword::SemiExpanded,
-                7 => FontStretchKeyword::Expanded,
-                8 => FontStretchKeyword::ExtraExpanded,
-                9 => FontStretchKeyword::UltraExpanded,
-                _ => return Err(()),
-            }
-            .compute(),
-        ));
+        let stretch = match min(9, max(1, width_val)) {
+            1 => FontStretchKeyword::UltraCondensed,
+            2 => FontStretchKeyword::ExtraCondensed,
+            3 => FontStretchKeyword::Condensed,
+            4 => FontStretchKeyword::SemiCondensed,
+            5 => FontStretchKeyword::Normal,
+            6 => FontStretchKeyword::SemiExpanded,
+            7 => FontStretchKeyword::Expanded,
+            8 => FontStretchKeyword::ExtraExpanded,
+            9 => FontStretchKeyword::UltraExpanded,
+            _ => return Err(()),
+        }
+        .compute();
 
         let style = if italic_bool {
-            GenericFontStyle::Italic
+            StyleFontStyle::ITALIC
         } else {
-            GenericFontStyle::Normal
+            StyleFontStyle::NORMAL
         };
 
         Ok(FontInfo {
@@ -206,26 +171,24 @@ impl FontInfo {
 
     fn new_from_font(font: &Font) -> Result<FontInfo, ()> {
         let style = match font.style() {
-            FontStyle::Normal => GenericFontStyle::Normal,
-            FontStyle::Oblique => GenericFontStyle::Oblique(StyleFontStyle::default_angle()),
-            FontStyle::Italic => GenericFontStyle::Italic,
+            FontStyle::Normal => StyleFontStyle::NORMAL,
+            FontStyle::Oblique => StyleFontStyle::OBLIQUE,
+            FontStyle::Italic => StyleFontStyle::ITALIC,
         };
-        let weight = StyleFontWeight(font.weight().to_u32() as f32);
-        let stretch = StyleFontStretch(NonNegative(
-            match font.stretch() {
-                FontStretch::Undefined => FontStretchKeyword::Normal,
-                FontStretch::UltraCondensed => FontStretchKeyword::UltraCondensed,
-                FontStretch::ExtraCondensed => FontStretchKeyword::ExtraCondensed,
-                FontStretch::Condensed => FontStretchKeyword::Condensed,
-                FontStretch::SemiCondensed => FontStretchKeyword::SemiCondensed,
-                FontStretch::Normal => FontStretchKeyword::Normal,
-                FontStretch::SemiExpanded => FontStretchKeyword::SemiExpanded,
-                FontStretch::Expanded => FontStretchKeyword::Expanded,
-                FontStretch::ExtraExpanded => FontStretchKeyword::ExtraExpanded,
-                FontStretch::UltraExpanded => FontStretchKeyword::UltraExpanded,
-            }
-            .compute(),
-        ));
+        let weight = StyleFontWeight::from_float(font.weight().to_u32() as f32);
+        let stretch = match font.stretch() {
+            FontStretch::Undefined => FontStretchKeyword::Normal,
+            FontStretch::UltraCondensed => FontStretchKeyword::UltraCondensed,
+            FontStretch::ExtraCondensed => FontStretchKeyword::ExtraCondensed,
+            FontStretch::Condensed => FontStretchKeyword::Condensed,
+            FontStretch::SemiCondensed => FontStretchKeyword::SemiCondensed,
+            FontStretch::Normal => FontStretchKeyword::Normal,
+            FontStretch::SemiExpanded => FontStretchKeyword::SemiExpanded,
+            FontStretch::Expanded => FontStretchKeyword::Expanded,
+            FontStretch::ExtraExpanded => FontStretchKeyword::ExtraExpanded,
+            FontStretch::UltraExpanded => FontStretchKeyword::UltraExpanded,
+        }
+        .compute();
 
         Ok(FontInfo {
             family_name: font.family_name(),

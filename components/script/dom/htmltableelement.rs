@@ -2,6 +2,14 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+use std::cell::Cell;
+
+use cssparser::RGBA;
+use dom_struct::dom_struct;
+use html5ever::{local_name, namespace_url, ns, LocalName, Prefix};
+use js::rust::HandleObject;
+use style::attr::{parse_unsigned_integer, AttrValue, LengthOrPercentageOrAuto};
+
 use crate::dom::attr::Attr;
 use crate::dom::bindings::codegen::Bindings::HTMLCollectionBinding::HTMLCollectionMethods;
 use crate::dom::bindings::codegen::Bindings::HTMLTableElementBinding::HTMLTableElementMethods;
@@ -20,11 +28,6 @@ use crate::dom::htmltablerowelement::HTMLTableRowElement;
 use crate::dom::htmltablesectionelement::HTMLTableSectionElement;
 use crate::dom::node::{document_from_node, window_from_node, Node};
 use crate::dom::virtualmethods::VirtualMethods;
-use cssparser::RGBA;
-use dom_struct::dom_struct;
-use html5ever::{LocalName, Prefix};
-use std::cell::Cell;
-use style::attr::{parse_unsigned_integer, AttrValue, LengthOrPercentageOrAuto};
 
 #[dom_struct]
 pub struct HTMLTableElement {
@@ -34,7 +37,7 @@ pub struct HTMLTableElement {
     tbodies: MutNullableDom<HTMLCollection>,
 }
 
-#[allow(unrooted_must_root)]
+#[allow(crown::unrooted_must_root)]
 #[derive(JSTraceable, MallocSizeOf)]
 struct TableRowFilter {
     sections: Vec<Dom<Node>>,
@@ -64,17 +67,19 @@ impl HTMLTableElement {
         }
     }
 
-    #[allow(unrooted_must_root)]
+    #[allow(crown::unrooted_must_root)]
     pub fn new(
         local_name: LocalName,
         prefix: Option<Prefix>,
         document: &Document,
+        proto: Option<HandleObject>,
     ) -> DomRoot<HTMLTableElement> {
-        let n = Node::reflect_node(
+        let n = Node::reflect_node_with_proto(
             Box::new(HTMLTableElement::new_inherited(
                 local_name, prefix, document,
             )),
             document,
+            proto,
         );
 
         n.upcast::<Node>().set_weird_parser_insertion_mode();
@@ -135,7 +140,8 @@ impl HTMLTableElement {
             return section;
         }
 
-        let section = HTMLTableSectionElement::new(atom.clone(), None, &document_from_node(self));
+        let section =
+            HTMLTableSectionElement::new(atom.clone(), None, &document_from_node(self), None);
         match atom {
             &local_name!("thead") => self.SetTHead(Some(&section)),
             &local_name!("tfoot") => self.SetTFoot(Some(&section)),
@@ -184,16 +190,17 @@ impl HTMLTableElementMethods for HTMLTableElement {
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-table-caption
-    fn SetCaption(&self, new_caption: Option<&HTMLTableCaptionElement>) {
+    fn SetCaption(&self, new_caption: Option<&HTMLTableCaptionElement>) -> Fallible<()> {
         if let Some(ref caption) = self.GetCaption() {
             caption.upcast::<Node>().remove_self();
         }
 
         if let Some(caption) = new_caption {
             let node = self.upcast::<Node>();
-            node.InsertBefore(caption.upcast(), node.GetFirstChild().as_deref())
-                .expect("Insertion failed");
+            node.InsertBefore(caption.upcast(), node.GetFirstChild().as_deref())?;
         }
+
+        Ok(())
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-table-createcaption
@@ -205,8 +212,10 @@ impl HTMLTableElementMethods for HTMLTableElement {
                     local_name!("caption"),
                     None,
                     &document_from_node(self),
+                    None,
                 );
-                self.SetCaption(Some(&caption));
+                self.SetCaption(Some(&caption))
+                    .expect("Generated caption is invalid");
                 caption
             },
         }
@@ -295,8 +304,12 @@ impl HTMLTableElementMethods for HTMLTableElement {
 
     // https://html.spec.whatwg.org/multipage/#dom-table-createtbody
     fn CreateTBody(&self) -> DomRoot<HTMLTableSectionElement> {
-        let tbody =
-            HTMLTableSectionElement::new(local_name!("tbody"), None, &document_from_node(self));
+        let tbody = HTMLTableSectionElement::new(
+            local_name!("tbody"),
+            None,
+            &document_from_node(self),
+            None,
+        );
         let node = self.upcast::<Node>();
         let last_tbody = node
             .rev_children()
@@ -318,7 +331,8 @@ impl HTMLTableElementMethods for HTMLTableElement {
             return Err(Error::IndexSize);
         }
 
-        let new_row = HTMLTableRowElement::new(local_name!("tr"), None, &document_from_node(self));
+        let new_row =
+            HTMLTableRowElement::new(local_name!("tr"), None, &document_from_node(self), None);
         let node = self.upcast::<Node>();
 
         if number_of_row_elements == 0 {

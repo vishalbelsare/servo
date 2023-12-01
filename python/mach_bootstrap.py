@@ -2,19 +2,23 @@
 # License, v. 2.0. If a copy of the MPL was not distributed with this
 # file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-from __future__ import print_function, unicode_literals
-
 import os
 import platform
 import sys
-from distutils.spawn import find_executable
-from subprocess import Popen
 import shutil
+
+from subprocess import Popen
 from tempfile import TemporaryFile
 
+SCRIPT_PATH = os.path.abspath(os.path.dirname(__file__))
+TOP_DIR = os.path.abspath(os.path.join(SCRIPT_PATH, ".."))
+WPT_PATH = os.path.join(TOP_DIR, "tests", "wpt")
+WPT_RUNNER_PATH = os.path.join(WPT_PATH, "tests", "tools", "wptrunner")
+WPT_SERVE_PATH = os.path.join(WPT_PATH, "tests", "tools", "wptserve")
+
 SEARCH_PATHS = [
-    os.path.join("python", "tidy"),
     os.path.join("python", "mach"),
+    os.path.join("third_party", "mozdebug"),
 ]
 
 # Individual files providing mach commands.
@@ -84,7 +88,7 @@ PYTHON_NAMES = ["python-2.7", "python2.7", "python2", "python"]
 
 def _get_exec_path(names, is_valid_path=lambda _path: True):
     for name in names:
-        path = find_executable(name)
+        path = shutil.which(name)
         if path and is_valid_path(path):
             return path
     return None
@@ -125,36 +129,7 @@ def _process_exec(args):
                 sys.exit(1)
 
 
-def wpt_path(is_firefox, topdir, *paths):
-    if is_firefox:
-        rel = os.path.join("..", "testing", "web-platform")
-    else:
-        rel = os.path.join("tests", "wpt")
-
-    return os.path.join(topdir, rel, *paths)
-
-
-def wptrunner_path(is_firefox, topdir, *paths):
-    wpt_root = wpt_path(is_firefox, topdir)
-    if is_firefox:
-        rel = os.path.join(wpt_root, "tests", "tools", "wptrunner")
-    else:
-        rel = os.path.join(wpt_root, "web-platform-tests", "tools", "wptrunner")
-
-    return os.path.join(topdir, rel, *paths)
-
-
-def wptserve_path(is_firefox, topdir, *paths):
-    wpt_root = wpt_path(is_firefox, topdir)
-    if is_firefox:
-        rel = os.path.join(wpt_root, "tests", "tools", "wptserve")
-    else:
-        rel = os.path.join(wpt_root, "web-platform-tests", "tools", "wptserve")
-
-    return os.path.join(topdir, rel, *paths)
-
-
-def _activate_virtualenv(topdir, is_firefox):
+def _activate_virtualenv(topdir):
     virtualenv_path = os.path.join(topdir, "python", "_virtualenv%d.%d" % (sys.version_info[0], sys.version_info[1]))
     python = sys.executable   # If there was no python, mach wouldn't have run at all!
     if not python:
@@ -164,10 +139,10 @@ def _activate_virtualenv(topdir, is_firefox):
     activate_path = os.path.join(virtualenv_path, script_dir, "activate_this.py")
     need_pip_upgrade = False
     if not (os.path.exists(virtualenv_path) and os.path.exists(activate_path)):
-        import imp
+        import importlib
         try:
-            imp.find_module('virtualenv')
-        except ImportError:
+            importlib.import_module('virtualenv')
+        except ModuleNotFoundError:
             sys.exit("Python virtualenv is not installed. Please install it prior to running mach.")
 
         _process_exec([python, "-m", "virtualenv", "-p", python, "--system-site-packages", virtualenv_path])
@@ -190,9 +165,7 @@ def _activate_virtualenv(topdir, is_firefox):
     # and it will check for conflicts.
     requirements_paths = [
         os.path.join("python", "requirements.txt"),
-        wptrunner_path(is_firefox, topdir, "requirements.txt",),
-        wptrunner_path(is_firefox, topdir, "requirements_firefox.txt"),
-        wptrunner_path(is_firefox, topdir, "requirements_servo.txt"),
+        os.path.join(WPT_RUNNER_PATH, "requirements.txt",),
     ]
 
     if need_pip_upgrade:
@@ -229,30 +202,24 @@ def _is_windows():
     return sys.platform == 'win32'
 
 
-class DummyContext(object):
-    pass
-
-
-def is_firefox_checkout(topdir):
-    parentdir = os.path.normpath(os.path.join(topdir, '..'))
-    is_firefox = os.path.isfile(os.path.join(parentdir,
-                                             'build/mach_bootstrap.py'))
-    return is_firefox
-
-
 def bootstrap_command_only(topdir):
     # we should activate the venv before importing servo.boostrap
     # because the module requires non-standard python packages
-    _activate_virtualenv(topdir, is_firefox_checkout(topdir))
+    _activate_virtualenv(topdir)
 
-    from servo.bootstrap import bootstrap
+    # We cannot import these modules until the virtual environment
+    # is active because they depend on modules installed via the
+    # virtual environment.
+    # pylint: disable=import-outside-toplevel
+    import servo.platform
+    import servo.util
 
-    context = DummyContext()
-    context.topdir = topdir
-    force = False
-    if len(sys.argv) == 3 and sys.argv[2] == "-f":
-        force = True
-    bootstrap(context, force)
+    try:
+        servo.platform.get().bootstrap('-f' in sys.argv or '--force' in sys.argv)
+    except NotImplementedError as exception:
+        print(exception)
+        return 1
+
     return 0
 
 
@@ -260,18 +227,6 @@ def bootstrap(topdir):
     _ensure_case_insensitive_if_windows()
 
     topdir = os.path.abspath(topdir)
-
-    len(sys.argv) > 1 and sys.argv[1] == "bootstrap"
-
-    # We don't support paths with Unicode characters for now
-    # https://github.com/servo/servo/issues/10002
-    try:
-        # Trick to support both python2 and python3
-        topdir.encode().decode('ascii')
-    except UnicodeDecodeError:
-        print('Cannot run mach in a path with Unicode characters.')
-        print('Current path:', topdir)
-        sys.exit(1)
 
     # We don't support paths with spaces for now
     # https://github.com/servo/servo/issues/9442
@@ -287,9 +242,7 @@ def bootstrap(topdir):
         print('You are running Python', platform.python_version())
         sys.exit(1)
 
-    is_firefox = is_firefox_checkout(topdir)
-
-    _activate_virtualenv(topdir, is_firefox)
+    _activate_virtualenv(topdir)
 
     def populate_context(context, key=None):
         if key is None:
@@ -299,10 +252,7 @@ def bootstrap(topdir):
         raise AttributeError(key)
 
     sys.path[0:0] = [os.path.join(topdir, path) for path in SEARCH_PATHS]
-
-    sys.path[0:0] = [wpt_path(is_firefox, topdir),
-                     wptrunner_path(is_firefox, topdir),
-                     wptserve_path(is_firefox, topdir)]
+    sys.path[0:0] = [WPT_PATH, WPT_RUNNER_PATH, WPT_SERVE_PATH]
 
     import mach.main
     mach = mach.main.Mach(os.getcwd())

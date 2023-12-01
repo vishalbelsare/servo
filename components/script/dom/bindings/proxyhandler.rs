@@ -6,6 +6,36 @@
 
 #![deny(missing_docs)]
 
+use std::ffi::CStr;
+use std::os::raw::c_char;
+use std::ptr;
+
+use js::conversions::ToJSValConvertible;
+use js::glue::{
+    GetProxyHandler, GetProxyHandlerFamily, GetProxyPrivate, InvokeGetOwnPropertyDescriptor,
+    SetProxyPrivate,
+};
+use js::jsapi;
+use js::jsapi::{
+    jsid, DOMProxyShadowsResult, GetObjectRealmOrNull, GetRealmPrincipals, GetStaticPrototype,
+    GetWellKnownSymbol, Handle as RawHandle, HandleId as RawHandleId,
+    HandleObject as RawHandleObject, HandleValue as RawHandleValue, JSAutoRealm, JSContext,
+    JSErrNum, JSFunctionSpec, JSObject, JSPropertySpec, JS_AtomizeAndPinString,
+    JS_DefinePropertyById, JS_GetOwnPropertyDescriptorById, JS_IsExceptionPending,
+    MutableHandle as RawMutableHandle, MutableHandleIdVector as RawMutableHandleIdVector,
+    MutableHandleObject as RawMutableHandleObject, MutableHandleValue as RawMutableHandleValue,
+    ObjectOpResult, PropertyDescriptor, SetDOMProxyInformation, SymbolCode,
+};
+use js::jsid::SymbolId;
+use js::jsval::{ObjectValue, UndefinedValue};
+use js::rust::wrappers::{
+    AppendToIdVector, JS_AlreadyHasOwnPropertyById, JS_NewObjectWithGivenProto,
+    SetDataPropertyDescriptor, RUST_INTERNED_STRING_TO_JSID,
+};
+use js::rust::{
+    get_context_realm, Handle, HandleObject, HandleValue, MutableHandle, MutableHandleObject,
+};
+
 use crate::dom::bindings::conversions::{is_dom_proxy, jsid_to_string, jsstring_to_str};
 use crate::dom::bindings::error::{throw_dom_exception, Error};
 use crate::dom::bindings::principals::ServoJSPrincipalsRef;
@@ -15,38 +45,6 @@ use crate::dom::bindings::utils::delete_property_by_id;
 use crate::dom::globalscope::GlobalScope;
 use crate::realms::{AlreadyInRealm, InRealm};
 use crate::script_runtime::JSContext as SafeJSContext;
-use js::conversions::ToJSValConvertible;
-use js::glue::{
-    GetProxyHandler, GetProxyHandlerFamily, InvokeGetOwnPropertyDescriptor, RUST_SYMBOL_TO_JSID,
-};
-use js::glue::{GetProxyPrivate, SetProxyPrivate};
-use js::jsapi;
-use js::jsapi::GetStaticPrototype;
-use js::jsapi::Handle as RawHandle;
-use js::jsapi::HandleId as RawHandleId;
-use js::jsapi::HandleObject as RawHandleObject;
-use js::jsapi::HandleValue as RawHandleValue;
-use js::jsapi::JSAutoRealm;
-use js::jsapi::JS_AtomizeAndPinString;
-use js::jsapi::JS_DefinePropertyById;
-use js::jsapi::JS_GetOwnPropertyDescriptorById;
-use js::jsapi::JS_IsExceptionPending;
-use js::jsapi::MutableHandle as RawMutableHandle;
-use js::jsapi::MutableHandleIdVector as RawMutableHandleIdVector;
-use js::jsapi::MutableHandleObject as RawMutableHandleObject;
-use js::jsapi::MutableHandleValue as RawMutableHandleValue;
-use js::jsapi::ObjectOpResult;
-use js::jsapi::{jsid, GetObjectRealmOrNull, GetRealmPrincipals, JSFunctionSpec, JSPropertySpec};
-use js::jsapi::{DOMProxyShadowsResult, JSContext, JSObject, PropertyDescriptor};
-use js::jsapi::{GetWellKnownSymbol, SymbolCode};
-use js::jsapi::{JSErrNum, SetDOMProxyInformation};
-use js::jsval::ObjectValue;
-use js::jsval::UndefinedValue;
-use js::rust::wrappers::JS_AlreadyHasOwnPropertyById;
-use js::rust::wrappers::JS_NewObjectWithGivenProto;
-use js::rust::wrappers::{AppendToIdVector, RUST_INTERNED_STRING_TO_JSID};
-use js::rust::{get_context_realm, Handle, HandleObject, MutableHandle, MutableHandleObject};
-use std::{ffi::CStr, os::raw::c_char, ptr};
 
 /// Determine if this id shadows any existing properties for this proxy.
 pub unsafe extern "C" fn shadow_check_callback(
@@ -189,15 +187,16 @@ pub unsafe fn ensure_expando_object(
 
 /// Set the property descriptor's object to `obj` and set it to enumerable,
 /// and writable if `readonly` is true.
-pub fn fill_property_descriptor(
-    mut desc: MutableHandle<PropertyDescriptor>,
-    obj: *mut JSObject,
+pub fn set_property_descriptor(
+    desc: MutableHandle<PropertyDescriptor>,
+    value: HandleValue,
     attrs: u32,
+    is_none: &mut bool,
 ) {
-    desc.obj = obj;
-    desc.attrs = attrs;
-    desc.getter = None;
-    desc.setter = None;
+    unsafe {
+        SetDataPropertyDescriptor(desc, value, attrs);
+    }
+    *is_none = false;
 }
 
 /// <https://html.spec.whatwg.org/multipage/#isplatformobjectsameorigin-(-o-)>
@@ -333,12 +332,14 @@ pub unsafe extern "C" fn maybe_cross_origin_set_rawcx(
     // OrdinarySet
     // <https://tc39.es/ecma262/#sec-ordinaryset>
     rooted!(in(*cx) let mut own_desc = PropertyDescriptor::default());
+    let mut is_none = false;
     if !InvokeGetOwnPropertyDescriptor(
         GetProxyHandler(*proxy),
         *cx,
         proxy,
         id,
         own_desc.handle_mut().into(),
+        &mut is_none,
     ) {
         return false;
     }
@@ -439,26 +440,28 @@ pub unsafe fn cross_origin_get(
 ) -> bool {
     // > 1. Let `desc` be `? O.[[GetOwnProperty]](P)`.
     rooted!(in(*cx) let mut descriptor = PropertyDescriptor::default());
+    let mut is_none = false;
     if !InvokeGetOwnPropertyDescriptor(
         GetProxyHandler(*proxy),
         *cx,
         proxy,
         id,
         descriptor.handle_mut().into(),
+        &mut is_none,
     ) {
         return false;
     }
 
     // > 2. Assert: `desc` is not undefined.
     assert!(
-        !descriptor.obj.is_null(),
+        !is_none,
         "Callees should throw in all cases when they are not finding \
         a property decriptor"
     );
 
     // > 3. If `! IsDataDescriptor(desc)` is true, then return `desc.[[Value]]`.
     if is_data_descriptor(&descriptor) {
-        vp.set(descriptor.value);
+        vp.set(descriptor.value_);
         return true;
     }
 
@@ -504,19 +507,21 @@ pub unsafe fn cross_origin_set(
 ) -> bool {
     // > 1. Let desc be ? O.[[GetOwnProperty]](P).
     rooted!(in(*cx) let mut descriptor = PropertyDescriptor::default());
+    let mut is_none = false;
     if !InvokeGetOwnPropertyDescriptor(
         GetProxyHandler(*proxy),
         *cx,
         proxy,
         id,
         descriptor.handle_mut().into(),
+        &mut is_none,
     ) {
         return false;
     }
 
     // > 2. Assert: desc is not undefined.
     assert!(
-        !descriptor.obj.is_null(),
+        !is_none,
         "Callees should throw in all cases when they are not finding \
         a property decriptor"
     );
@@ -557,32 +562,25 @@ pub unsafe fn cross_origin_set(
 }
 
 unsafe fn get_getter_object(d: &PropertyDescriptor, out: RawMutableHandleObject) {
-    if (d.attrs & jsapi::JSPROP_GETTER as u32) != 0 {
-        out.set(std::mem::transmute(d.getter));
+    if d.hasGetter_() {
+        out.set(std::mem::transmute(d.getter_));
     }
 }
 
 unsafe fn get_setter_object(d: &PropertyDescriptor, out: RawMutableHandleObject) {
-    if (d.attrs & jsapi::JSPROP_SETTER as u32) != 0 {
-        out.set(std::mem::transmute(d.setter));
+    if d.hasSetter_() {
+        out.set(std::mem::transmute(d.setter_));
     }
 }
 
 /// <https://tc39.es/ecma262/#sec-isaccessordescriptor>
 fn is_accessor_descriptor(d: &PropertyDescriptor) -> bool {
-    d.attrs & (jsapi::JSPROP_GETTER as u32 | jsapi::JSPROP_SETTER as u32) != 0
+    d.hasSetter_() || d.hasGetter_()
 }
 
 /// <https://tc39.es/ecma262/#sec-isdatadescriptor>
 fn is_data_descriptor(d: &PropertyDescriptor) -> bool {
-    let is_accessor = is_accessor_descriptor(d);
-    let is_generic = d.attrs &
-        (jsapi::JSPROP_GETTER as u32 |
-            jsapi::JSPROP_SETTER as u32 |
-            jsapi::JSPROP_IGNORE_READONLY |
-            jsapi::JSPROP_IGNORE_VALUE) ==
-        jsapi::JSPROP_IGNORE_READONLY | jsapi::JSPROP_IGNORE_VALUE;
-    !is_accessor && !is_generic
+    d.hasWritable_() || d.hasValue_()
 }
 
 /// Evaluate `CrossOriginGetOwnPropertyHelper(proxy, id) != null`.
@@ -621,7 +619,8 @@ pub unsafe fn cross_origin_get_own_property_helper(
     proxy: RawHandleObject,
     cross_origin_properties: &'static CrossOriginProperties,
     id: RawHandleId,
-    mut desc: RawMutableHandle<PropertyDescriptor>,
+    desc: RawMutableHandle<PropertyDescriptor>,
+    is_none: &mut bool,
 ) -> bool {
     rooted!(in(*cx) let mut holder = ptr::null_mut::<JSObject>());
 
@@ -632,15 +631,7 @@ pub unsafe fn cross_origin_get_own_property_helper(
         holder.handle_mut().into(),
     );
 
-    if !JS_GetOwnPropertyDescriptorById(*cx, holder.handle().into(), id, desc) {
-        return false;
-    }
-
-    if !desc.obj.is_null() {
-        desc.obj = proxy.get();
-    }
-
-    true
+    return JS_GetOwnPropertyDescriptorById(*cx, holder.handle().into(), id, desc, is_none);
 }
 
 /// Implementation of [`CrossOriginPropertyFallback`].
@@ -651,24 +642,24 @@ pub unsafe fn cross_origin_get_own_property_helper(
 /// [`CrossOriginPropertyFallback`]: https://html.spec.whatwg.org/multipage/#crossoriginpropertyfallback-(-p-)
 pub unsafe fn cross_origin_property_fallback(
     cx: SafeJSContext,
-    proxy: RawHandleObject,
+    _proxy: RawHandleObject,
     id: RawHandleId,
-    mut desc: RawMutableHandle<PropertyDescriptor>,
+    desc: RawMutableHandle<PropertyDescriptor>,
+    is_none: &mut bool,
 ) -> bool {
-    assert!(desc.obj.is_null(), "why are we being called?");
+    assert!(*is_none, "why are we being called?");
 
     // > 1. If P is `then`, `@@toStringTag`, `@@hasInstance`, or
     // >    `@@isConcatSpreadable`, then return `PropertyDescriptor{ [[Value]]:
     // >    undefined, [[Writable]]: false, [[Enumerable]]: false,
     // >    [[Configurable]]: true }`.
     if is_cross_origin_allowlisted_prop(cx, id) {
-        *desc = PropertyDescriptor {
-            getter: None,
-            setter: None,
-            value: UndefinedValue(),
-            attrs: jsapi::JSPROP_READONLY as u32,
-            obj: proxy.get(),
-        };
+        set_property_descriptor(
+            MutableHandle::from_raw(desc),
+            HandleValue::undefined(),
+            jsapi::JSPROP_READONLY as u32,
+            is_none,
+        );
         return true;
     }
 
@@ -689,13 +680,10 @@ unsafe fn is_cross_origin_allowlisted_prop(cx: SafeJSContext, id: RawHandleId) -
 
     rooted!(in(*cx) let mut allowed_id: jsid);
     ALLOWLISTED_SYMBOL_CODES.iter().any(|&allowed_code| {
-        RUST_SYMBOL_TO_JSID(
-            GetWellKnownSymbol(*cx, allowed_code),
-            allowed_id.handle_mut().into(),
-        );
+        *allowed_id.handle_mut() = SymbolId(GetWellKnownSymbol(*cx, allowed_code));
         // `jsid`s containing `JS::Symbol *` can be compared by
         // referential equality
-        allowed_id.get().asBits == id.asBits
+        allowed_id.get().asBits_ == id.asBits_
     })
 }
 
@@ -715,10 +703,7 @@ unsafe fn append_cross_origin_allowlisted_prop_keys(
     AppendToIdVector(props, id.handle());
 
     for &allowed_code in ALLOWLISTED_SYMBOL_CODES.iter() {
-        RUST_SYMBOL_TO_JSID(
-            GetWellKnownSymbol(*cx, allowed_code),
-            id.handle_mut().into(),
-        );
+        *id.handle_mut() = SymbolId(GetWellKnownSymbol(*cx, allowed_code));
         AppendToIdVector(props, id.handle());
     }
 }

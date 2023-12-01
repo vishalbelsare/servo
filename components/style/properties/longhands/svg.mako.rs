@@ -20,7 +20,7 @@ ${helpers.single_keyword(
 ${helpers.predefined_type(
     "stop-color",
     "Color",
-    "RGBA::new(0, 0, 0, 255).into()",
+    "computed::Color::black()",
     engines="gecko",
     animation_value_type="AnimatedRGBA",
     spec="https://www.w3.org/TR/SVGTiny12/painting.html#StopColorProperty",
@@ -40,7 +40,7 @@ ${helpers.predefined_type(
 ${helpers.predefined_type(
     "flood-color",
     "Color",
-    "RGBA::new(0, 0, 0, 255).into()",
+    "computed::Color::black()",
     engines="gecko",
     animation_value_type="AnimatedColor",
     spec="https://www.w3.org/TR/SVG/filters.html#FloodColorProperty",
@@ -58,7 +58,7 @@ ${helpers.predefined_type(
 ${helpers.predefined_type(
     "lighting-color",
     "Color",
-    "RGBA::new(255, 255, 255, 255).into()",
+    "computed::Color::white()",
     engines="gecko",
     animation_value_type="AnimatedColor",
     spec="https://www.w3.org/TR/SVG/filters.html#LightingColorProperty",
@@ -80,8 +80,8 @@ ${helpers.predefined_type(
     "basic_shape::ClipPath",
     "generics::basic_shape::ClipPath::None",
     engines="gecko",
+    extra_prefixes="webkit",
     animation_value_type="basic_shape::ClipPath",
-    flags="CREATES_STACKING_CONTEXT",
     spec="https://drafts.fxtf.org/css-masking/#propdef-clip-path",
 )}
 
@@ -183,7 +183,6 @@ ${helpers.predefined_type(
     vector=True,
     extra_prefixes="webkit",
     animation_value_type="discrete",
-    flags="CREATES_STACKING_CONTEXT",
 )}
 
 ${helpers.predefined_type(
@@ -247,4 +246,13 @@ ${helpers.predefined_type(
     engines="gecko",
     animation_value_type="LengthPercentage",
     spec="https://svgwg.org/svg2-draft/geometry.html#R",
+)}
+
+${helpers.predefined_type(
+    "d",
+    "DProperty",
+    "specified::DProperty::none()",
+    engines="gecko",
+    animation_value_type="ComputedValue",
+    spec="https://svgwg.org/svg2-draft/paths.html#TheDProperty",
 )}

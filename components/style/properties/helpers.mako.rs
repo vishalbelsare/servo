@@ -9,14 +9,11 @@
 %>
 
 <%def name="predefined_type(name, type, initial_value, parse_method='parse',
-            vector=False,
-            computed_type=None, initial_specified_value=None,
+            vector=False, initial_specified_value=None,
             allow_quirks='No', allow_empty=False, **kwargs)">
     <%def name="predefined_type_inner(name, type, initial_value, parse_method)">
         #[allow(unused_imports)]
         use app_units::Au;
-        #[allow(unused_imports)]
-        use cssparser::{Color as CSSParserColor, RGBA};
         #[allow(unused_imports)]
         use crate::values::specified::AllowQuirks;
         #[allow(unused_imports)]
@@ -25,11 +22,7 @@
         use smallvec::SmallVec;
         pub use crate::values::specified::${type} as SpecifiedValue;
         pub mod computed_value {
-            % if computed_type:
-            pub use ${computed_type} as T;
-            % else:
             pub use crate::values::computed::${type} as T;
-            % endif
         }
         % if initial_value:
         #[inline] pub fn get_initial_value() -> computed_value::T { ${initial_value} }
@@ -119,8 +112,6 @@
             use crate::values::computed::{Context, ToComputedValue};
             #[allow(unused_imports)]
             use crate::values::{computed, specified};
-            #[allow(unused_imports)]
-            use crate::values::{Auto, Either, None_};
             ${caller.body()}
         }
 
@@ -265,8 +256,7 @@
                 Sorry, this is stupid but needed for now.
             % endif
 
-            use crate::properties::animated_properties::ListAnimation;
-            use crate::values::animated::{Animate, ToAnimatedZero, Procedure};
+            use crate::values::animated::{Animate, ToAnimatedZero, Procedure, lists};
             use crate::values::distance::{SquaredDistance, ComputeSquaredDistance};
 
             // FIXME(emilio): For some reason rust thinks that this alias is
@@ -303,7 +293,7 @@
                     procedure: Procedure,
                 ) -> Result<Self, ()> {
                     Ok(OwnedList(
-                        self.0.animate_${vector_animation_type}(&other.0, procedure)?
+                        lists::${vector_animation_type}::animate(&self.0, &other.0, procedure)?
                     ))
                 }
             }
@@ -312,7 +302,7 @@
                     &self,
                     other: &Self,
                 ) -> Result<SquaredDistance, ()> {
-                    self.0.squared_distance_${vector_animation_type}(&other.0)
+                    lists::${vector_animation_type}::squared_distance(&self.0, &other.0)
                 }
             }
             % endif
@@ -414,8 +404,6 @@
         #[allow(unused_imports)]
         use crate::properties::{UnparsedValue, ShorthandId};
         #[allow(unused_imports)]
-        use crate::values::{Auto, Either, None_};
-        #[allow(unused_imports)]
         use crate::error_reporting::ParseErrorReporter;
         #[allow(unused_imports)]
         use crate::properties::longhands;
@@ -443,13 +431,7 @@
             declaration: &PropertyDeclaration,
             context: &mut computed::Context,
         ) {
-            context.for_non_inherited_property =
-                % if property.style_struct.inherited:
-                    None;
-                % else:
-                    Some(LonghandId::${property.camel_case});
-                % endif
-
+            context.for_non_inherited_property = ${"false" if property.style_struct.inherited else "true"};
             let specified_value = match *declaration {
                 PropertyDeclaration::${property.camel_case}(ref value) => value,
                 PropertyDeclaration::CSSWideKeyword(ref declaration) => {
@@ -476,6 +458,7 @@
                                 context.builder.inherit_${property.ident}();
                             % endif
                         }
+                        CSSWideKeyword::RevertLayer |
                         CSSWideKeyword::Revert => unreachable!("Should never get here"),
                     }
                     return;
@@ -538,105 +521,6 @@
                 .map(PropertyDeclaration::${property.camel_case})
         }
     }
-</%def>
-
-<%def name="single_keyword_system(name, values, **kwargs)">
-    <%
-        keyword_kwargs = {a: kwargs.pop(a, None) for a in [
-            'gecko_constant_prefix',
-            'gecko_enum_prefix',
-            'extra_gecko_values',
-            'extra_servo_2013_values',
-            'extra_servo_2020_values',
-            'custom_consts',
-            'gecko_inexhaustive',
-        ]}
-        keyword = keyword=Keyword(name, values, **keyword_kwargs)
-    %>
-    <%call expr="longhand(name, keyword=Keyword(name, values, **keyword_kwargs), **kwargs)">
-        use crate::properties::longhands::system_font::SystemFont;
-
-        pub mod computed_value {
-            #[cfg_attr(feature = "servo", derive(Deserialize, Serialize))]
-            #[derive(
-                Clone,
-                Copy,
-                Debug,
-                Eq,
-                FromPrimitive,
-                Hash,
-                MallocSizeOf,
-                Parse,
-                PartialEq,
-                SpecifiedValueInfo,
-                ToCss,
-                ToResolvedValue,
-                ToShmem,
-            )]
-            pub enum T {
-            % for value in keyword.values_for(engine):
-                ${to_camel_case(value)},
-            % endfor
-            }
-
-            ${gecko_keyword_conversion(keyword, keyword.values_for(engine), type="T", cast_to="i32")}
-        }
-
-        #[cfg_attr(feature = "gecko", derive(MallocSizeOf))]
-        #[derive(Clone, Copy, Debug, Eq, PartialEq, SpecifiedValueInfo, ToCss, ToShmem)]
-        pub enum SpecifiedValue {
-            Keyword(computed_value::T),
-            #[css(skip)]
-            System(SystemFont),
-        }
-
-        pub fn parse<'i, 't>(_: &ParserContext, input: &mut Parser<'i, 't>) -> Result<SpecifiedValue, ParseError<'i>> {
-            Ok(SpecifiedValue::Keyword(computed_value::T::parse(input)?))
-        }
-
-        impl ToComputedValue for SpecifiedValue {
-            type ComputedValue = computed_value::T;
-            fn to_computed_value(&self, _cx: &Context) -> Self::ComputedValue {
-                match *self {
-                    SpecifiedValue::Keyword(v) => v,
-                    % if engine == "gecko":
-                        SpecifiedValue::System(_) => {
-                            _cx.cached_system_font.as_ref().unwrap().${to_rust_ident(name)}
-                        }
-                    % else:
-                        SpecifiedValue::System(system_font) => {
-                            match system_font {}
-                        }
-                    % endif
-                }
-            }
-            fn from_computed_value(other: &computed_value::T) -> Self {
-                SpecifiedValue::Keyword(*other)
-            }
-        }
-
-        #[inline]
-        pub fn get_initial_value() -> computed_value::T {
-            computed_value::T::${to_camel_case(values.split()[0])}
-        }
-        #[inline]
-        pub fn get_initial_specified_value() -> SpecifiedValue {
-            SpecifiedValue::Keyword(computed_value::T::${to_camel_case(values.split()[0])})
-        }
-
-        impl SpecifiedValue {
-            pub fn system_font(f: SystemFont) -> Self {
-                SpecifiedValue::System(f)
-            }
-            pub fn get_system(&self) -> Option<SystemFont> {
-                if let SpecifiedValue::System(s) = *self {
-                    Some(s)
-                } else {
-                    None
-                }
-            }
-        }
-    </%call>
 </%def>
 
 <%def name="gecko_keyword_conversion(keyword, values=None, type='SpecifiedValue', cast_to=None)">
@@ -707,29 +591,28 @@
 </%def>
 
 <%def name="single_keyword(name, values, vector=False,
-            extra_specified=None, needs_conversion=False,
-            gecko_pref_controlled_initial_value=None, **kwargs)">
+            needs_conversion=False, **kwargs)">
     <%
         keyword_kwargs = {a: kwargs.pop(a, None) for a in [
             'gecko_constant_prefix',
             'gecko_enum_prefix',
             'extra_gecko_values',
-            'extra_servo_2013_values',
-            'extra_servo_2020_values',
+            'extra_servo_values',
             'gecko_aliases',
-            'servo_2013_aliases',
-            'servo_2020_aliases',
+            'servo_aliases',
             'custom_consts',
             'gecko_inexhaustive',
             'gecko_strip_moz_prefix',
         ]}
     %>
 
-    <%def name="inner_body(keyword, extra_specified=None, needs_conversion=False,
-                           gecko_pref_controlled_initial_value=None)">
-        <%def name="variants(variants, include_aliases)">
-            % for variant in variants:
-            % if include_aliases:
+    <%def name="inner_body(keyword, needs_conversion=False)">
+        pub use self::computed_value::T as SpecifiedValue;
+        pub mod computed_value {
+            #[cfg_attr(feature = "servo", derive(Deserialize, Serialize))]
+            #[derive(Clone, Copy, Debug, Eq, FromPrimitive, Hash, MallocSizeOf, Parse, PartialEq, SpecifiedValueInfo, ToComputedValue, ToCss, ToResolvedValue, ToShmem)]
+            pub enum T {
+            % for variant in keyword.values_for(engine):
             <%
                 aliases = []
                 for alias, v in keyword.aliases_for(engine).items():
@@ -739,56 +622,16 @@
             % if aliases:
             #[parse(aliases = "${','.join(sorted(aliases))}")]
             % endif
-            % endif
             ${to_camel_case(variant)},
             % endfor
-        </%def>
-        % if extra_specified:
-            #[cfg_attr(feature = "servo", derive(Deserialize, Serialize))]
-            #[derive(
-                Clone,
-                Copy,
-                Debug,
-                Eq,
-                MallocSizeOf,
-                Parse,
-                PartialEq,
-                SpecifiedValueInfo,
-                ToCss,
-                ToShmem,
-            )]
-            pub enum SpecifiedValue {
-                ${variants(keyword.values_for(engine) + extra_specified.split(), bool(extra_specified))}
-            }
-        % else:
-            pub use self::computed_value::T as SpecifiedValue;
-        % endif
-        pub mod computed_value {
-            #[cfg_attr(feature = "servo", derive(Deserialize, Serialize))]
-            #[derive(Clone, Copy, Debug, Eq, FromPrimitive, MallocSizeOf, PartialEq, ToCss, ToResolvedValue)]
-            % if not extra_specified:
-            #[derive(Parse, SpecifiedValueInfo, ToComputedValue, ToShmem)]
-            % endif
-            pub enum T {
-                ${variants(data.longhands_by_name[name].keyword.values_for(engine), not extra_specified)}
             }
         }
         #[inline]
         pub fn get_initial_value() -> computed_value::T {
-            % if engine == "gecko" and gecko_pref_controlled_initial_value:
-            if static_prefs::pref!("${gecko_pref_controlled_initial_value.split('=')[0]}") {
-                return computed_value::T::${to_camel_case(gecko_pref_controlled_initial_value.split('=')[1])};
-            }
-            % endif
             computed_value::T::${to_camel_case(values.split()[0])}
         }
         #[inline]
         pub fn get_initial_specified_value() -> SpecifiedValue {
-            % if engine == "gecko" and gecko_pref_controlled_initial_value:
-            if static_prefs::pref!("${gecko_pref_controlled_initial_value.split('=')[0]}") {
-                return SpecifiedValue::${to_camel_case(gecko_pref_controlled_initial_value.split('=')[1])};
-            }
-            % endif
             SpecifiedValue::${to_camel_case(values.split()[0])}
         }
         #[inline]
@@ -799,10 +642,7 @@
 
         % if needs_conversion:
             <%
-                conversion_values = keyword.values_for(engine)
-                if extra_specified:
-                    conversion_values += extra_specified.split()
-                conversion_values += keyword.aliases_for(engine).keys()
+                conversion_values = keyword.values_for(engine) + list(keyword.aliases_for(engine).keys())
             %>
             ${gecko_keyword_conversion(keyword, values=conversion_values)}
         % endif
@@ -817,8 +657,7 @@
     % else:
         <%call expr="longhand(name, keyword=Keyword(name, values, **keyword_kwargs), **kwargs)">
             ${inner_body(Keyword(name, values, **keyword_kwargs),
-                         extra_specified=extra_specified, needs_conversion=needs_conversion,
-                         gecko_pref_controlled_initial_value=gecko_pref_controlled_initial_value)}
+                         needs_conversion=needs_conversion)}
             % if caller:
             ${caller.body()}
             % endif
@@ -888,10 +727,7 @@
         impl<'a> LonghandsToSerialize<'a> {
             /// Tries to get a serializable set of longhands given a set of
             /// property declarations.
-            pub fn from_iter<I>(iter: I) -> Result<Self, ()>
-            where
-                I: Iterator<Item=&'a PropertyDeclaration>,
-            {
+            pub fn from_iter(iter: impl Iterator<Item = &'a PropertyDeclaration>) -> Result<Self, ()> {
                 // Define all of the expected variables that correspond to the shorthand
                 % for sub_property in shorthand.sub_properties:
                     let mut ${sub_property.ident} =
@@ -899,8 +735,8 @@
                 % endfor
 
                 // Attempt to assign the incoming declarations to the expected variables
-                for longhand in iter {
-                    match *longhand {
+                for declaration in iter {
+                    match *declaration {
                         % for sub_property in shorthand.sub_properties:
                             PropertyDeclaration::${sub_property.camel_case}(ref value) => {
                                 ${sub_property.ident} = Some(value)
@@ -961,6 +797,14 @@
             })
         }
 
+        /// Try to serialize a given shorthand to a string.
+        pub fn to_css(declarations: &[&PropertyDeclaration], dest: &mut crate::str::CssStringWriter) -> fmt::Result {
+            match LonghandsToSerialize::from_iter(declarations.iter().cloned()) {
+                Ok(longhands) => longhands.to_css(&mut CssWriter::new(dest)),
+                Err(_) => Ok(())
+            }
+        }
+
         ${caller.body()}
     }
     % endif
@@ -1008,7 +852,7 @@
 
             first.to_css(dest)?;
             if first != second {
-                dest.write_str(" ")?;
+                dest.write_char(' ')?;
                 second.to_css(dest)?;
             }
             Ok(())

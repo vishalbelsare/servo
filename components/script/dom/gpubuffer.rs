@@ -2,11 +2,25 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+use std::cell::{Cell, RefCell};
+use std::ffi::c_void;
+use std::ops::Range;
+use std::ptr::NonNull;
+use std::rc::Rc;
+use std::string::String;
+
+use dom_struct::dom_struct;
+use ipc_channel::ipc::IpcSharedMemory;
+use js::jsapi::{DetachArrayBuffer, Heap, JSObject, NewExternalArrayBuffer};
+use webgpu::identity::WebGPUOpResult;
+use webgpu::wgpu::device::HostMap;
+use webgpu::{WebGPU, WebGPUBuffer, WebGPURequest, WebGPUResponse, WebGPUResponseResult};
+
 use crate::dom::bindings::cell::DomRefCell;
-use crate::dom::bindings::codegen::Bindings::GPUBufferBinding::{GPUBufferMethods, GPUSize64};
-use crate::dom::bindings::codegen::Bindings::GPUMapModeBinding::GPUMapModeConstants;
+use crate::dom::bindings::codegen::Bindings::WebGPUBinding::{
+    GPUBufferMethods, GPUMapModeConstants, GPUSize64,
+};
 use crate::dom::bindings::error::{Error, Fallible};
-use crate::dom::bindings::reflector::DomObject;
 use crate::dom::bindings::reflector::{reflect_dom_object, Reflector};
 use crate::dom::bindings::root::{Dom, DomRoot};
 use crate::dom::bindings::str::USVString;
@@ -16,21 +30,6 @@ use crate::dom::gpudevice::GPUDevice;
 use crate::dom::promise::Promise;
 use crate::realms::InRealm;
 use crate::script_runtime::JSContext;
-use dom_struct::dom_struct;
-use ipc_channel::ipc::IpcSharedMemory;
-use js::jsapi::DetachArrayBuffer;
-use js::jsapi::NewExternalArrayBuffer;
-use js::jsapi::{Heap, JSObject};
-use std::cell::{Cell, RefCell};
-use std::ffi::c_void;
-use std::ops::Range;
-use std::ptr::NonNull;
-use std::rc::Rc;
-use std::string::String;
-use webgpu::{
-    identity::WebGPUOpResult, wgpu::device::HostMap, WebGPU, WebGPUBuffer, WebGPURequest,
-    WebGPUResponse, WebGPUResponseResult,
-};
 
 const RANGE_OFFSET_ALIGN_MASK: u64 = 8;
 const RANGE_SIZE_ALIGN_MASK: u64 = 4;
@@ -60,9 +59,11 @@ pub struct GPUBufferMapInfo {
 pub struct GPUBuffer {
     reflector_: Reflector,
     #[ignore_malloc_size_of = "defined in webgpu"]
+    #[no_trace]
     channel: WebGPU,
-    label: DomRefCell<Option<USVString>>,
+    label: DomRefCell<USVString>,
     state: Cell<GPUBufferState>,
+    #[no_trace]
     buffer: WebGPUBuffer,
     device: Dom<GPUDevice>,
     size: GPUSize64,
@@ -79,7 +80,7 @@ impl GPUBuffer {
         state: GPUBufferState,
         size: GPUSize64,
         map_info: DomRefCell<Option<GPUBufferMapInfo>>,
-        label: Option<USVString>,
+        label: USVString,
     ) -> Self {
         Self {
             reflector_: Reflector::new(),
@@ -103,7 +104,7 @@ impl GPUBuffer {
         state: GPUBufferState,
         size: GPUSize64,
         map_info: DomRefCell<Option<GPUBufferMapInfo>>,
-        label: Option<USVString>,
+        label: USVString,
     ) -> DomRoot<Self> {
         reflect_dom_object(
             Box::new(GPUBuffer::new_inherited(
@@ -126,20 +127,22 @@ impl GPUBuffer {
 
 impl Drop for GPUBuffer {
     fn drop(&mut self) {
-        self.Destroy()
+        if let Err(e) = self.Destroy() {
+            error!("GPUBuffer destruction failed with {e:?}!"); // TODO: should we allow panic here?
+        };
     }
 }
 
 impl GPUBufferMethods for GPUBuffer {
     #[allow(unsafe_code)]
     /// https://gpuweb.github.io/gpuweb/#dom-gpubuffer-unmap
-    fn Unmap(&self) {
-        let cx = self.global().get_cx();
+    fn Unmap(&self) -> Fallible<()> {
+        let cx = GlobalScope::get_cx();
         // Step 1
         match self.state.get() {
             GPUBufferState::Unmapped | GPUBufferState::Destroyed => {
                 // TODO: Record validation error on the current scope
-                return;
+                return Ok(());
             },
             // Step 3
             GPUBufferState::Mapped | GPUBufferState::MappedAtCreation => {
@@ -175,16 +178,17 @@ impl GPUBufferMethods for GPUBuffer {
         // Step 4
         self.state.set(GPUBufferState::Unmapped);
         *self.map_info.borrow_mut() = None;
+        Ok(())
     }
 
     /// https://gpuweb.github.io/gpuweb/#dom-gpubuffer-destroy
-    fn Destroy(&self) {
+    fn Destroy(&self) -> Fallible<()> {
         let state = self.state.get();
         match state {
             GPUBufferState::Mapped | GPUBufferState::MappedAtCreation => {
-                self.Unmap();
+                self.Unmap()?;
             },
-            GPUBufferState::Destroyed => return,
+            GPUBufferState::Destroyed => return Ok(()),
             _ => {},
         };
         if let Err(e) = self
@@ -198,6 +202,7 @@ impl GPUBufferMethods for GPUBuffer {
             );
         };
         self.state.set(GPUBufferState::Destroyed);
+        Ok(())
     }
 
     #[allow(unsafe_code)]
@@ -209,7 +214,7 @@ impl GPUBufferMethods for GPUBuffer {
         size: Option<GPUSize64>,
         comp: InRealm,
     ) -> Rc<Promise> {
-        let promise = Promise::new_in_current_realm(&self.global(), comp);
+        let promise = Promise::new_in_current_realm(comp);
         let range_size = if let Some(s) = size {
             s
         } else if offset >= self.size {
@@ -329,12 +334,12 @@ impl GPUBufferMethods for GPUBuffer {
     }
 
     /// https://gpuweb.github.io/gpuweb/#dom-gpuobjectbase-label
-    fn GetLabel(&self) -> Option<USVString> {
+    fn Label(&self) -> USVString {
         self.label.borrow().clone()
     }
 
     /// https://gpuweb.github.io/gpuweb/#dom-gpuobjectbase-label
-    fn SetLabel(&self, value: Option<USVString>) {
+    fn SetLabel(&self, value: USVString) {
         *self.label.borrow_mut() = value;
     }
 }

@@ -11,25 +11,25 @@ name = "webdriver_server"
 path = "lib.rs"
 
 [dependencies]
-base64 = "0.10"
-compositing = { path = "../compositing" }
-cookie = "0.11"
-crossbeam-channel = "0.4"
-euclid = "0.20"
-headers = "0.3"
-http = "0.2"
-image = "0.23"
-ipc-channel = "0.14"
-keyboard-types = "0.5"
-log = "0.4"
-msg = { path = "../msg" }
-net_traits = { path = "../net_traits" }
+base64 = { workspace = true }
+compositing_traits = { workspace = true }
+cookie = { workspace = true }
+crossbeam-channel = { workspace = true }
+euclid = { workspace = true }
+headers = { workspace = true }
+http = { workspace = true }
+image = { workspace = true }
+ipc-channel = { workspace = true }
+keyboard-types = { workspace = true }
+log = { workspace = true }
+msg = { workspace = true }
+net_traits = { workspace = true }
 pixels = { path = "../pixels" }
-script_traits = { path = "../script_traits" }
-serde = "1"
-serde_json = "1"
+script_traits = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
 servo_config = { path = "../config" }
 servo_url = { path = "../url" }
-style_traits = { path = "../style_traits" }
-uuid = { version = "0.8", features = ["v4"] }
-webdriver = "0.44"
+style_traits = { workspace = true }
+uuid = { workspace = true }
+webdriver = { workspace = true }

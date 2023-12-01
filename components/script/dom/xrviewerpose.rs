@@ -2,6 +2,13 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+use dom_struct::dom_struct;
+use euclid::RigidTransform3D;
+use js::conversions::ToJSValConvertible;
+use js::jsapi::Heap;
+use js::jsval::{JSVal, UndefinedValue};
+use webxr_api::{Viewer, ViewerPose, Views};
+
 use crate::dom::bindings::codegen::Bindings::XRViewBinding::XREye;
 use crate::dom::bindings::codegen::Bindings::XRViewerPoseBinding::XRViewerPoseMethods;
 use crate::dom::bindings::reflector::reflect_dom_object;
@@ -13,12 +20,6 @@ use crate::dom::xrsession::{cast_transform, BaseSpace, BaseTransform, XRSession}
 use crate::dom::xrview::XRView;
 use crate::realms::enter_realm;
 use crate::script_runtime::JSContext;
-use dom_struct::dom_struct;
-use euclid::RigidTransform3D;
-use js::conversions::ToJSValConvertible;
-use js::jsapi::Heap;
-use js::jsval::{JSVal, UndefinedValue};
-use webxr_api::{Viewer, ViewerPose, Views};
 
 #[dom_struct]
 pub struct XRViewerPose {
@@ -150,11 +151,11 @@ impl XRViewerPose {
             },
         };
         let transform: RigidTransform3D<f32, Viewer, BaseSpace> =
-            to_base.pre_transform(&viewer_pose.transform);
+            viewer_pose.transform.then(&to_base);
         let transform = XRRigidTransform::new(global, cast_transform(transform));
         let pose = reflect_dom_object(Box::new(XRViewerPose::new_inherited(&transform)), global);
 
-        let cx = global.get_cx();
+        let cx = GlobalScope::get_cx();
         unsafe {
             rooted!(in(*cx) let mut jsval = UndefinedValue());
             views.to_jsval(*cx, jsval.handle_mut());

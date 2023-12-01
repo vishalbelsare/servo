@@ -4,26 +4,26 @@
 
 // https://www.khronos.org/registry/webgl/specs/latest/1.0/webgl.idl
 
+use std::cell::Cell;
+use std::cmp;
+
+use canvas_traits::webgl::{
+    webgl_channel, TexDataType, TexFormat, TexParameter, TexParameterBool, TexParameterInt,
+    WebGLCommand, WebGLError, WebGLResult, WebGLTextureId,
+};
+use dom_struct::dom_struct;
+
 use crate::dom::bindings::cell::DomRefCell;
 use crate::dom::bindings::codegen::Bindings::EXTTextureFilterAnisotropicBinding::EXTTextureFilterAnisotropicConstants;
 use crate::dom::bindings::codegen::Bindings::WebGL2RenderingContextBinding::WebGL2RenderingContextConstants as constants;
 use crate::dom::bindings::inheritance::Castable;
 use crate::dom::bindings::reflector::{reflect_dom_object, DomObject};
-use crate::dom::bindings::root::Dom;
-use crate::dom::bindings::root::{DomRoot, MutNullableDom};
+use crate::dom::bindings::root::{Dom, DomRoot, MutNullableDom};
 use crate::dom::webgl_validations::types::TexImageTarget;
 use crate::dom::webglframebuffer::WebGLFramebuffer;
 use crate::dom::webglobject::WebGLObject;
 use crate::dom::webglrenderingcontext::{Operation, WebGLRenderingContext};
 use crate::dom::xrsession::XRSession;
-use canvas_traits::webgl::{
-    webgl_channel, TexDataType, TexFormat, TexParameter, TexParameterBool, TexParameterInt,
-    WebGLResult, WebGLTextureId,
-};
-use canvas_traits::webgl::{DOMToTextureCommand, WebGLCommand, WebGLError};
-use dom_struct::dom_struct;
-use std::cell::Cell;
-use std::cmp;
 
 pub enum TexParameterValue {
     Float(f32),
@@ -33,7 +33,7 @@ pub enum TexParameterValue {
 
 // Textures generated for WebXR are owned by the WebXR device, not by the WebGL thread
 // so the GL texture should not be deleted when the texture is garbage collected.
-#[unrooted_must_root_lint::must_root]
+#[crown::unrooted_must_root_lint::must_root]
 #[derive(JSTraceable, MallocSizeOf)]
 enum WebGLTextureOwner {
     WebGL,
@@ -43,11 +43,10 @@ enum WebGLTextureOwner {
 const MAX_LEVEL_COUNT: usize = 31;
 const MAX_FACE_COUNT: usize = 6;
 
-jsmanaged_array!(MAX_LEVEL_COUNT * MAX_FACE_COUNT);
-
 #[dom_struct]
 pub struct WebGLTexture {
     webgl_object: WebGLObject,
+    #[no_trace]
     id: WebGLTextureId,
     /// The target to which this texture was bound the first time
     target: Cell<Option<u32>>,
@@ -62,8 +61,6 @@ pub struct WebGLTexture {
     // Store information for min and mag filters
     min_filter: Cell<u32>,
     mag_filter: Cell<u32>,
-    /// True if this texture is used for the DOMToTexture feature.
-    attached_to_dom: Cell<bool>,
     /// Framebuffer that this texture is attached to.
     attached_framebuffer: MutNullableDom<WebGLFramebuffer>,
     /// Number of immutable levels.
@@ -90,7 +87,6 @@ impl WebGLTexture {
             min_filter: Cell::new(constants::NEAREST_MIPMAP_LINEAR),
             mag_filter: Cell::new(constants::LINEAR),
             image_info_array: DomRefCell::new([None; MAX_LEVEL_COUNT * MAX_FACE_COUNT]),
-            attached_to_dom: Cell::new(false),
             attached_framebuffer: Default::default(),
         }
     }
@@ -224,12 +220,6 @@ impl WebGLTexture {
         if !self.is_deleted.get() {
             self.is_deleted.set(true);
             let context = self.upcast::<WebGLObject>().context();
-            // Notify WR to release the frame output when using DOMToTexture feature
-            if self.attached_to_dom.get() {
-                let _ = context
-                    .webgl_sender()
-                    .send_dom_to_texture(DOMToTextureCommand::Detach(self.id));
-            }
 
             /*
             If a texture object is deleted while its image is attached to one or more attachment
@@ -469,10 +459,6 @@ impl WebGLTexture {
         self.image_info_at_face(0, self.base_mipmap_level)
     }
 
-    pub fn set_attached_to_dom(&self) {
-        self.attached_to_dom.set(true);
-    }
-
     pub fn attach_to_framebuffer(&self, fb: &WebGLFramebuffer) {
         self.attached_framebuffer.set(Some(fb));
     }
@@ -545,7 +531,9 @@ pub struct ImageInfo {
     width: u32,
     height: u32,
     depth: u32,
+    #[no_trace]
     internal_format: TexFormat,
+    #[no_trace]
     data_type: Option<TexDataType>,
 }
 
@@ -594,6 +582,7 @@ pub enum TexCompressionValidation {
 
 #[derive(Clone, Copy, Debug, JSTraceable, MallocSizeOf)]
 pub struct TexCompression {
+    #[no_trace]
     pub format: TexFormat,
     pub bytes_per_block: u8,
     pub block_width: u8,

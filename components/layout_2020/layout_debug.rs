@@ -5,13 +5,19 @@
 //! Supports writing a trace file created during each layout scope
 //! that can be viewed by an external tool to make layout debugging easier.
 
-use crate::flow::{BoxTree, FragmentTree};
-use serde_json::{to_string, to_value, Value};
 use std::cell::RefCell;
 use std::fs;
 #[cfg(debug_assertions)]
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+
+#[cfg(not(debug_assertions))]
+use serde::ser::Serializer;
+use serde::Serialize;
+use serde_json::{to_string, to_value, Value};
+
+use crate::flow::BoxTree;
+use crate::fragment_tree::FragmentTree;
 
 thread_local!(static STATE_KEY: RefCell<Option<State>> = RefCell::new(None));
 
@@ -101,12 +107,6 @@ impl Drop for Scope {
     }
 }
 
-/// Generate a unique ID for Fragments.
-#[cfg(debug_assertions)]
-pub fn generate_unique_debug_id() -> u16 {
-    DEBUG_ID_COUNTER.fetch_add(1, Ordering::SeqCst) as u16
-}
-
 /// Begin a layout debug trace. If this has not been called,
 /// creating debug scopes has no effect.
 pub fn begin_trace(box_tree: Arc<BoxTree>, fragment_tree: Arc<FragmentTree>) {
@@ -145,4 +145,34 @@ pub fn end_trace(generation: u32) {
         result.as_bytes(),
     )
     .unwrap();
+}
+
+#[cfg(not(debug_assertions))]
+#[derive(Clone, Debug)]
+pub struct DebugId;
+
+#[cfg(debug_assertions)]
+#[derive(Clone, Debug, Serialize)]
+#[serde(transparent)]
+pub struct DebugId(u16);
+
+#[cfg(not(debug_assertions))]
+impl DebugId {
+    pub fn new() -> DebugId {
+        DebugId
+    }
+}
+
+#[cfg(debug_assertions)]
+impl DebugId {
+    pub fn new() -> DebugId {
+        DebugId(DEBUG_ID_COUNTER.fetch_add(1, Ordering::SeqCst) as u16)
+    }
+}
+
+#[cfg(not(debug_assertions))]
+impl Serialize for DebugId {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&format!("{:p}", &self))
+    }
 }

@@ -7,9 +7,10 @@
 use crate::parser::{Parse, ParserContext};
 use crate::values::computed::percentage::Percentage as ComputedPercentage;
 use crate::values::computed::{Context, ToComputedValue};
+use crate::values::generics::NonNegative;
 use crate::values::specified::calc::CalcNode;
 use crate::values::specified::Number;
-use crate::values::{serialize_percentage, CSSFloat};
+use crate::values::{normalize, serialize_percentage, CSSFloat};
 use cssparser::{Parser, Token};
 use std::fmt::{self, Write};
 use style_traits::values::specified::AllowedNumericType;
@@ -39,7 +40,7 @@ impl ToCss for Percentage {
         serialize_percentage(self.value, dest)?;
 
         if self.calc_clamping_mode.is_some() {
-            dest.write_str(")")?;
+            dest.write_char(')')?;
         }
         Ok(())
     }
@@ -91,9 +92,9 @@ impl Percentage {
         Number::new_with_clamping_mode(self.value, self.calc_clamping_mode)
     }
 
-    /// Returns whether this percentage is a `calc()` value.
-    pub fn is_calc(&self) -> bool {
-        self.calc_clamping_mode.is_some()
+    /// Returns the calc() clamping mode for this percentage.
+    pub fn calc_clamping_mode(&self) -> Option<AllowedNumericType> {
+        self.calc_clamping_mode
     }
 
     /// Reverses this percentage, preserving calc-ness.
@@ -118,7 +119,7 @@ impl Percentage {
                 Ok(Percentage::new(unit_value))
             },
             Token::Function(ref name) => {
-                let function = CalcNode::math_function(name, location)?;
+                let function = CalcNode::math_function(context, name, location)?;
                 let value = CalcNode::parse_percentage(context, input, function)?;
                 Ok(Percentage {
                     value,
@@ -135,6 +136,15 @@ impl Percentage {
         input: &mut Parser<'i, 't>,
     ) -> Result<Self, ParseError<'i>> {
         Self::parse_with_clamping_mode(context, input, AllowedNumericType::NonNegative)
+    }
+
+    /// Parses a percentage token, but rejects it if it's negative or more than
+    /// 100%.
+    pub fn parse_zero_to_a_hundred<'i, 't>(
+        context: &ParserContext,
+        input: &mut Parser<'i, 't>,
+    ) -> Result<Self, ParseError<'i>> {
+        Self::parse_with_clamping_mode(context, input, AllowedNumericType::ZeroToOne)
     }
 
     /// Clamp to 100% if the value is over 100%.
@@ -162,7 +172,7 @@ impl ToComputedValue for Percentage {
 
     #[inline]
     fn to_computed_value(&self, _: &Context) -> Self::ComputedValue {
-        ComputedPercentage(self.get())
+        ComputedPercentage(normalize(self.get()))
     }
 
     #[inline]
@@ -172,3 +182,44 @@ impl ToComputedValue for Percentage {
 }
 
 impl SpecifiedValueInfo for Percentage {}
+
+/// Turns the percentage into a plain float.
+pub trait ToPercentage {
+    /// Returns whether this percentage used to be a calc().
+    fn is_calc(&self) -> bool {
+        false
+    }
+    /// Turns the percentage into a plain float.
+    fn to_percentage(&self) -> CSSFloat;
+}
+
+impl ToPercentage for Percentage {
+    fn is_calc(&self) -> bool {
+        self.calc_clamping_mode.is_some()
+    }
+
+    fn to_percentage(&self) -> CSSFloat {
+        self.get()
+    }
+}
+
+/// A wrapper of Percentage, whose value must be >= 0.
+pub type NonNegativePercentage = NonNegative<Percentage>;
+
+impl Parse for NonNegativePercentage {
+    #[inline]
+    fn parse<'i, 't>(
+        context: &ParserContext,
+        input: &mut Parser<'i, 't>,
+    ) -> Result<Self, ParseError<'i>> {
+        Ok(NonNegative(Percentage::parse_non_negative(context, input)?))
+    }
+}
+
+impl NonNegativePercentage {
+    /// Convert to ComputedPercentage, for FontFaceRule size-adjust getter.
+    #[inline]
+    pub fn compute(&self) -> ComputedPercentage {
+        ComputedPercentage(self.0.get())
+    }
+}

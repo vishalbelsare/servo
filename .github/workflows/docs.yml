@@ -7,10 +7,12 @@ on:
 
 jobs:
   upload-docs:
+    # This job is only useful when run on upstream servo.
+    if: github.repository == 'servo/servo' || github.event_name == 'workflow_dispatch'
     name: Upload docs to GitHub Pages
     runs-on: ubuntu-20.04
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v3
         with:
           fetch-depth: 2
       - name: Bootstrap
@@ -21,7 +23,7 @@ jobs:
       - name: Compile docs
         run: python3 ./mach doc
         env:
-          RUSTDOCFLAGS: --disable-minification
+          RUSTDOCFLAGS: -Z unstable-options --disable-minification --document-private-items
       - name: Upload docs
         run: |
           cd target/doc

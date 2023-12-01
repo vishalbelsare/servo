@@ -5,18 +5,20 @@
 use crate::parser::SelectorImpl;
 use cssparser::ToCss;
 use std::fmt;
+#[cfg(feature = "shmem")]
+use to_shmem_derive::ToShmem;
 
-#[derive(Clone, Eq, PartialEq, ToShmem)]
-#[shmem(no_bounds)]
+#[derive(Clone, Eq, PartialEq)]
+#[cfg_attr(feature = "shmem", derive(ToShmem))]
+#[cfg_attr(feature = "shmem", shmem(no_bounds))]
 pub struct AttrSelectorWithOptionalNamespace<Impl: SelectorImpl> {
-    #[shmem(field_bound)]
+    #[cfg_attr(feature = "shmem", shmem(field_bound))]
     pub namespace: Option<NamespaceConstraint<(Impl::NamespacePrefix, Impl::NamespaceUrl)>>,
-    #[shmem(field_bound)]
+    #[cfg_attr(feature = "shmem", shmem(field_bound))]
     pub local_name: Impl::LocalName,
     pub local_name_lower: Impl::LocalName,
-    #[shmem(field_bound)]
+    #[cfg_attr(feature = "shmem", shmem(field_bound))]
     pub operation: ParsedAttrSelectorOperation<Impl::AttrValue>,
-    pub never_matches: bool,
 }
 
 impl<Impl: SelectorImpl> AttrSelectorWithOptionalNamespace<Impl> {
@@ -28,7 +30,8 @@ impl<Impl: SelectorImpl> AttrSelectorWithOptionalNamespace<Impl> {
     }
 }
 
-#[derive(Clone, Eq, PartialEq, ToShmem)]
+#[derive(Clone, Eq, PartialEq)]
+#[cfg_attr(feature = "shmem", derive(ToShmem))]
 pub enum NamespaceConstraint<NamespaceUrl> {
     Any,
 
@@ -36,13 +39,14 @@ pub enum NamespaceConstraint<NamespaceUrl> {
     Specific(NamespaceUrl),
 }
 
-#[derive(Clone, Eq, PartialEq, ToShmem)]
+#[derive(Clone, Eq, PartialEq)]
+#[cfg_attr(feature = "shmem", derive(ToShmem))]
 pub enum ParsedAttrSelectorOperation<AttrValue> {
     Exists,
     WithValue {
         operator: AttrSelectorOperator,
         case_sensitivity: ParsedCaseSensitivity,
-        expected_value: AttrValue,
+        value: AttrValue,
     },
 }
 
@@ -52,7 +56,7 @@ pub enum AttrSelectorOperation<AttrValue> {
     WithValue {
         operator: AttrSelectorOperator,
         case_sensitivity: CaseSensitivity,
-        expected_value: AttrValue,
+        value: AttrValue,
     },
 }
 
@@ -66,17 +70,18 @@ impl<AttrValue> AttrSelectorOperation<AttrValue> {
             AttrSelectorOperation::WithValue {
                 operator,
                 case_sensitivity,
-                ref expected_value,
+                ref value,
             } => operator.eval_str(
                 element_attr_value,
-                expected_value.as_ref(),
+                value.as_ref(),
                 case_sensitivity,
             ),
         }
     }
 }
 
-#[derive(Clone, Copy, Eq, PartialEq, ToShmem)]
+#[derive(Clone, Copy, Eq, PartialEq)]
+#[cfg_attr(feature = "shmem", derive(ToShmem))]
 pub enum AttrSelectorOperator {
     Equal,
     Includes,
@@ -116,16 +121,21 @@ impl AttrSelectorOperator {
         let case = case_sensitivity;
         match self {
             AttrSelectorOperator::Equal => case.eq(e, s),
-            AttrSelectorOperator::Prefix => e.len() >= s.len() && case.eq(&e[..s.len()], s),
+            AttrSelectorOperator::Prefix => {
+                !s.is_empty() && e.len() >= s.len() && case.eq(&e[..s.len()], s)
+            },
             AttrSelectorOperator::Suffix => {
-                e.len() >= s.len() && case.eq(&e[(e.len() - s.len())..], s)
+                !s.is_empty() && e.len() >= s.len() && case.eq(&e[(e.len() - s.len())..], s)
             },
             AttrSelectorOperator::Substring => {
-                case.contains(element_attr_value, attr_selector_value)
+                !s.is_empty() && case.contains(element_attr_value, attr_selector_value)
             },
-            AttrSelectorOperator::Includes => element_attr_value
-                .split(SELECTOR_WHITESPACE)
-                .any(|part| case.eq(part.as_bytes(), s)),
+            AttrSelectorOperator::Includes => {
+                !s.is_empty() &&
+                    element_attr_value
+                        .split(SELECTOR_WHITESPACE)
+                        .any(|part| case.eq(part.as_bytes(), s))
+            },
             AttrSelectorOperator::DashMatch => {
                 case.eq(e, s) || (e.get(s.len()) == Some(&b'-') && case.eq(&e[..s.len()], s))
             },
@@ -136,35 +146,17 @@ impl AttrSelectorOperator {
 /// The definition of whitespace per CSS Selectors Level 3 § 4.
 pub static SELECTOR_WHITESPACE: &[char] = &[' ', '\t', '\n', '\r', '\x0C'];
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, ToShmem)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "shmem", derive(ToShmem))]
 pub enum ParsedCaseSensitivity {
-    // 's' was specified.
+    /// 's' was specified.
     ExplicitCaseSensitive,
-    // 'i' was specified.
+    /// 'i' was specified.
     AsciiCaseInsensitive,
-    // No flags were specified and HTML says this is a case-sensitive attribute.
+    /// No flags were specified and HTML says this is a case-sensitive attribute.
     CaseSensitive,
-    // No flags were specified and HTML says this is a case-insensitive attribute.
+    /// No flags were specified and HTML says this is a case-insensitive attribute.
     AsciiCaseInsensitiveIfInHtmlElementInHtmlDocument,
-}
-
-impl ParsedCaseSensitivity {
-    pub fn to_unconditional(self, is_html_element_in_html_document: bool) -> CaseSensitivity {
-        match self {
-            ParsedCaseSensitivity::AsciiCaseInsensitiveIfInHtmlElementInHtmlDocument
-                if is_html_element_in_html_document =>
-            {
-                CaseSensitivity::AsciiCaseInsensitive
-            },
-            ParsedCaseSensitivity::AsciiCaseInsensitiveIfInHtmlElementInHtmlDocument => {
-                CaseSensitivity::CaseSensitive
-            },
-            ParsedCaseSensitivity::CaseSensitive | ParsedCaseSensitivity::ExplicitCaseSensitive => {
-                CaseSensitivity::CaseSensitive
-            },
-            ParsedCaseSensitivity::AsciiCaseInsensitive => CaseSensitivity::AsciiCaseInsensitive,
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

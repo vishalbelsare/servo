@@ -3,51 +3,45 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 //! Utilities for querying the layout, as needed by the layout thread.
-use crate::context::LayoutContext;
-use crate::flow::FragmentTree;
-use crate::fragments::{Fragment, Tag};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+
 use app_units::Au;
 use euclid::default::{Point2D, Rect};
-use euclid::Size2D;
-use euclid::Vector2D;
-use ipc_channel::ipc::IpcSender;
+use euclid::{Size2D, Vector2D};
+use log::warn;
 use msg::constellation_msg::PipelineId;
-use script_layout_interface::rpc::TextIndexResponse;
-use script_layout_interface::rpc::{ContentBoxResponse, ContentBoxesResponse, LayoutRPC};
-use script_layout_interface::rpc::{NodeGeometryResponse, NodeScrollIdResponse};
-use script_layout_interface::rpc::{OffsetParentResponse, ResolvedStyleResponse};
+use script_layout_interface::rpc::{
+    ContentBoxResponse, ContentBoxesResponse, LayoutRPC, NodeGeometryResponse,
+    NodeScrollIdResponse, OffsetParentResponse, ResolvedStyleResponse, TextIndexResponse,
+};
 use script_layout_interface::wrapper_traits::{
     LayoutNode, ThreadSafeLayoutElement, ThreadSafeLayoutNode,
 };
-use script_traits::LayoutMsg as ConstellationMsg;
 use script_traits::UntrustedNodeAddress;
 use servo_arc::Arc as ServoArc;
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
 use style::computed_values::position::T as Position;
 use style::context::{StyleContext, ThreadLocalStyleContext};
-use style::dom::OpaqueNode;
-use style::dom::TElement;
+use style::dom::{OpaqueNode, TElement};
 use style::properties::style_structs::Font;
 use style::properties::{LonghandId, PropertyDeclarationId, PropertyId};
 use style::selector_parser::PseudoElement;
 use style::stylist::RuleInclusion;
 use style::traversal::resolve_style;
 use style::values::generics::text::LineHeight;
-use style_traits::CSSPixel;
-use style_traits::ToCss;
+use style_traits::{CSSPixel, ToCss};
 use webrender_api::units::LayoutPixel;
-use webrender_api::ExternalScrollId;
+use webrender_api::{DisplayListBuilder, ExternalScrollId};
+
+use crate::context::LayoutContext;
+use crate::fragment_tree::{Fragment, FragmentFlags, FragmentTree, Tag};
 
 /// Mutable data belonging to the LayoutThread.
 ///
 /// This needs to be protected by a mutex so we can do fast RPCs.
 pub struct LayoutThreadData {
-    /// The channel on which messages can be sent to the constellation.
-    pub constellation_chan: IpcSender<ConstellationMsg>,
-
     /// The root stacking context.
-    pub display_list: Option<webrender_api::DisplayListBuilder>,
+    pub display_list: Option<DisplayListBuilder>,
 
     /// A queued response for the union of the content boxes of a node.
     pub content_box_response: Option<Rect<Au>>,
@@ -62,7 +56,7 @@ pub struct LayoutThreadData {
     pub scroll_id_response: Option<ExternalScrollId>,
 
     /// A queued response for the scroll {top, left, width, height} of a node in pixels.
-    pub scroll_area_response: Rect<i32>,
+    pub scrolling_area_response: Rect<i32>,
 
     /// A queued response for the resolved style property of an element.
     pub resolved_style_response: String,
@@ -121,9 +115,9 @@ impl LayoutRPC for LayoutRPCImpl {
         }
     }
 
-    fn node_scroll_area(&self) -> NodeGeometryResponse {
+    fn scrolling_area(&self) -> NodeGeometryResponse {
         NodeGeometryResponse {
-            client_rect: self.0.lock().unwrap().scroll_area_response,
+            client_rect: self.0.lock().unwrap().scrolling_area_response,
         }
     }
 
@@ -206,8 +200,20 @@ pub fn process_node_scroll_id_request<'dom>(
 }
 
 /// https://drafts.csswg.org/cssom-view/#scrolling-area
-pub fn process_node_scroll_area_request(_requested_node: OpaqueNode) -> Rect<i32> {
-    Rect::zero()
+pub fn process_node_scroll_area_request(
+    requested_node: Option<OpaqueNode>,
+    fragment_tree: Option<Arc<FragmentTree>>,
+) -> Rect<i32> {
+    let rect = match (fragment_tree, requested_node) {
+        (Some(tree), Some(node)) => tree.get_scrolling_area_for_node(node),
+        (Some(tree), None) => tree.get_scrolling_area_for_viewport(),
+        _ => return Rect::zero(),
+    };
+
+    Rect::new(
+        Point2D::new(rect.origin.x.px() as i32, rect.origin.y.px() as i32),
+        Size2D::new(rect.size.width.px() as i32, rect.size.height.px() as i32),
+    )
 }
 
 /// Return the resolved value of property for a given (pseudo)element.
@@ -261,13 +267,7 @@ pub fn process_resolved_style_request<'dom>(
     let computed_style =
         || style.computed_value_to_string(PropertyDeclarationId::Longhand(longhand_id));
 
-    let opaque = node.opaque();
-    let tag_to_find = match *pseudo {
-        None => Tag::Node(opaque),
-        Some(PseudoElement::Before) => Tag::BeforePseudo(opaque),
-        Some(PseudoElement::After) => Tag::AfterPseudo(opaque),
-        Some(_) => unreachable!("Should have returned before this point."),
-    };
+    let tag_to_find = Tag::new_pseudo(node.opaque(), *pseudo);
 
     // https://drafts.csswg.org/cssom/#dom-window-getcomputedstyle
     // Here we are trying to conform to the specification that says that getComputedStyle
@@ -278,7 +278,7 @@ pub fn process_resolved_style_request<'dom>(
     // For line height, the resolved value is the computed value if it
     // is "normal" and the used value otherwise.
     if longhand_id == LonghandId::LineHeight {
-        let font_size = style.get_font().font_size.size.0;
+        let font_size = style.get_font().font_size.computed_size();
         return match style.get_inherited_text().line_height {
             LineHeight::Normal => computed_style(),
             LineHeight::Number(value) => (font_size * value.0).to_css_string(),
@@ -300,12 +300,27 @@ pub fn process_resolved_style_request<'dom>(
     };
     fragment_tree
         .find(|fragment, _, containing_block| {
+            if Some(tag_to_find) != fragment.tag() {
+                return None;
+            }
+
             let box_fragment = match fragment {
-                Fragment::Box(ref box_fragment) if box_fragment.tag == tag_to_find => box_fragment,
+                Fragment::Box(ref box_fragment) => box_fragment,
                 _ => return None,
             };
 
-            let positioned = style.get_box().position != Position::Static;
+            if style.get_box().position != Position::Static {
+                let resolved_insets =
+                    || box_fragment.calculate_resolved_insets_if_positioned(containing_block);
+                match longhand_id {
+                    LonghandId::Top => return Some(resolved_insets().top.to_css_string()),
+                    LonghandId::Right => return Some(resolved_insets().right.to_css_string()),
+                    LonghandId::Bottom => return Some(resolved_insets().bottom.to_css_string()),
+                    LonghandId::Left => return Some(resolved_insets().left.to_css_string()),
+                    _ => {},
+                }
+            }
+
             let content_rect = box_fragment
                 .content_rect
                 .to_physical(box_fragment.style.writing_mode, &containing_block);
@@ -326,13 +341,6 @@ pub fn process_resolved_style_request<'dom>(
                 LonghandId::PaddingTop => Some(padding.top),
                 LonghandId::PaddingLeft => Some(padding.left),
                 LonghandId::PaddingRight => Some(padding.right),
-                // TODO(mrobinson): These following values are often wrong, because these are not
-                // exactly the "used value" for the positional properties. The real used values are
-                // lost by the time the Fragment tree is constructed, so we may need to record them in
-                // the tree to properly answer this query. That said, we can return an okayish value
-                // sometimes simply by using the calculated position in the containing block.
-                LonghandId::Top if positioned => Some(content_rect.origin.y),
-                LonghandId::Left if positioned => Some(content_rect.origin.x),
                 _ => None,
             }
             .map(|value| value.to_css_string())
@@ -351,14 +359,20 @@ pub fn process_resolved_style_request_for_unstyled_node<'dom>(
         return String::new();
     }
 
-    let mut tlc = ThreadLocalStyleContext::new(&context.style_context);
+    let mut tlc = ThreadLocalStyleContext::new();
     let mut context = StyleContext {
         shared: &context.style_context,
         thread_local: &mut tlc,
     };
 
     let element = node.as_element().unwrap();
-    let styles = resolve_style(&mut context, element, RuleInclusion::All, pseudo.as_ref());
+    let styles = resolve_style(
+        &mut context,
+        element,
+        RuleInclusion::All,
+        pseudo.as_ref(),
+        None,
+    );
     let style = styles.primary();
     let longhand_id = match *property {
         PropertyId::LonghandAlias(id, _) | PropertyId::Longhand(id) => id,
@@ -397,13 +411,14 @@ fn process_offset_parent_query_inner(
 
     // https://www.w3.org/TR/2016/WD-cssom-view-1-20160317/#extensions-to-the-htmlelement-interface
     let mut parent_node_addresses = Vec::new();
+    let tag_to_find = Tag::new(node);
     let node_offset_box = fragment_tree.find(|fragment, level, containing_block| {
-        // FIXME: Is there a less fragile way of checking whether this
-        // fragment is the body element, rather than just checking that
-        // it's at level 1 (below the root node)?
-        let is_body_element = level == 1;
+        let base = fragment.base()?;
+        let is_body_element = base
+            .flags
+            .contains(FragmentFlags::IS_BODY_ELEMENT_OF_HTML_ELEMENT_ROOT);
 
-        if fragment.tag() == Some(Tag::Node(node)) {
+        if fragment.tag() == Some(tag_to_find) {
             // Only consider the first fragment of the node found as per a
             // possible interpretation of the specification: "[...] return the
             // y-coordinate of the top border edge of the first CSS layout box
@@ -419,7 +434,7 @@ fn process_offset_parent_query_inner(
             //
             // [1]: https://github.com/w3c/csswg-drafts/issues/4541
             let fragment_relative_rect = match fragment {
-                Fragment::Box(fragment) => fragment
+                Fragment::Box(fragment) | Fragment::Float(fragment) => fragment
                     .border_rect()
                     .to_physical(fragment.style.writing_mode, &containing_block),
                 Fragment::Text(fragment) => fragment
@@ -427,6 +442,7 @@ fn process_offset_parent_query_inner(
                     .to_physical(fragment.parent_style.writing_mode, &containing_block),
                 Fragment::AbsoluteOrFixedPositioned(_) |
                 Fragment::Image(_) |
+                Fragment::IFrame(_) |
                 Fragment::Anonymous(_) => unreachable!(),
             };
             let border_box = fragment_relative_rect.translate(containing_block.origin.to_vector());
@@ -476,7 +492,7 @@ fn process_offset_parent_query_inner(
         } else {
             // Record the paths of the nodes being traversed.
             let parent_node_address = match fragment {
-                Fragment::Box(fragment) => {
+                Fragment::Box(fragment) | Fragment::Float(fragment) => {
                     let is_eligible_parent =
                         match (is_body_element, fragment.style.get_box().position) {
                             // Spec says the element is eligible as `offsetParent` if any of
@@ -487,22 +503,23 @@ fn process_offset_parent_query_inner(
                             // TODO: Handle case 2
                             (true, _) |
                             (false, Position::Absolute) |
+                            (false, Position::Fixed) |
                             (false, Position::Relative) |
-                            (false, Position::Fixed) => true,
+                            (false, Position::Sticky) => true,
 
                             // Otherwise, it's not a valid parent
                             (false, Position::Static) => false,
                         };
 
-                    if let Tag::Node(node_address) = fragment.tag {
-                        is_eligible_parent.then(|| node_address)
-                    } else {
-                        None
+                    match base.tag {
+                        Some(tag) if is_eligible_parent && !tag.is_pseudo() => Some(tag.node),
+                        _ => None,
                     }
                 },
                 Fragment::AbsoluteOrFixedPositioned(_) |
                 Fragment::Text(_) |
                 Fragment::Image(_) |
+                Fragment::IFrame(_) |
                 Fragment::Anonymous(_) => None,
             };
 
@@ -529,29 +546,32 @@ fn process_offset_parent_query_inner(
             //
             // Since we saw `offset_parent_node_address` once, we should be able
             // to find it again.
+            let offset_parent_node_tag = Tag::new(offset_parent_node_address);
             fragment_tree
                 .find(|fragment, _, containing_block| {
                     match fragment {
-                        Fragment::Box(fragment)
-                            if fragment.tag == Tag::Node(offset_parent_node_address) =>
-                        {
-                            // Again, take the *first* associated CSS layout box.
-                            let padding_box_corner = fragment
-                                .padding_rect()
-                                .to_physical(fragment.style.writing_mode, &containing_block)
-                                .origin
-                                .to_vector() +
-                                containing_block.origin.to_vector();
-                            let padding_box_corner = Vector2D::new(
-                                Au::from_f32_px(padding_box_corner.x.px()),
-                                Au::from_f32_px(padding_box_corner.y.px()),
-                            );
-                            Some(padding_box_corner)
+                        Fragment::Box(fragment) | Fragment::Float(fragment) => {
+                            if fragment.base.tag == Some(offset_parent_node_tag) {
+                                // Again, take the *first* associated CSS layout box.
+                                let padding_box_corner = fragment
+                                    .padding_rect()
+                                    .to_physical(fragment.style.writing_mode, &containing_block)
+                                    .origin
+                                    .to_vector() +
+                                    containing_block.origin.to_vector();
+                                let padding_box_corner = Vector2D::new(
+                                    Au::from_f32_px(padding_box_corner.x.px()),
+                                    Au::from_f32_px(padding_box_corner.y.px()),
+                                );
+                                Some(padding_box_corner)
+                            } else {
+                                None
+                            }
                         },
                         Fragment::AbsoluteOrFixedPositioned(_) |
-                        Fragment::Box(_) |
                         Fragment::Text(_) |
                         Fragment::Image(_) |
+                        Fragment::IFrame(_) |
                         Fragment::Anonymous(_) => None,
                     }
                 })

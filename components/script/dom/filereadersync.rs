@@ -2,21 +2,24 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+use std::ptr;
+use std::ptr::NonNull;
+
+use dom_struct::dom_struct;
+use js::jsapi::JSObject;
+use js::rust::HandleObject;
+use js::typedarray::{ArrayBuffer, CreateWith};
+
 use crate::dom::bindings::codegen::Bindings::BlobBinding::BlobMethods;
 use crate::dom::bindings::codegen::Bindings::FileReaderSyncBinding::FileReaderSyncMethods;
 use crate::dom::bindings::error::{Error, Fallible};
-use crate::dom::bindings::reflector::{reflect_dom_object, Reflector};
+use crate::dom::bindings::reflector::{reflect_dom_object_with_proto, Reflector};
 use crate::dom::bindings::root::DomRoot;
 use crate::dom::bindings::str::DOMString;
 use crate::dom::blob::Blob;
 use crate::dom::filereader::FileReaderSharedFunctionality;
 use crate::dom::globalscope::GlobalScope;
 use crate::script_runtime::JSContext;
-use dom_struct::dom_struct;
-use js::jsapi::JSObject;
-use js::typedarray::{ArrayBuffer, CreateWith};
-use std::ptr;
-use std::ptr::NonNull;
 
 #[dom_struct]
 pub struct FileReaderSync {
@@ -30,13 +33,16 @@ impl FileReaderSync {
         }
     }
 
-    pub fn new(global: &GlobalScope) -> DomRoot<FileReaderSync> {
-        reflect_dom_object(Box::new(FileReaderSync::new_inherited()), global)
+    fn new(global: &GlobalScope, proto: Option<HandleObject>) -> DomRoot<FileReaderSync> {
+        reflect_dom_object_with_proto(Box::new(FileReaderSync::new_inherited()), global, proto)
     }
 
     #[allow(non_snake_case)]
-    pub fn Constructor(global: &GlobalScope) -> Fallible<DomRoot<FileReaderSync>> {
-        Ok(FileReaderSync::new(global))
+    pub fn Constructor(
+        global: &GlobalScope,
+        proto: Option<HandleObject>,
+    ) -> Fallible<DomRoot<FileReaderSync>> {
+        Ok(FileReaderSync::new(global, proto))
     }
 
     fn get_blob_bytes(blob: &Blob) -> Result<Vec<u8>, Error> {

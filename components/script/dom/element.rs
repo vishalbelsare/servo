@@ -4,6 +4,66 @@
 
 //! Element nodes.
 
+use std::borrow::Cow;
+use std::cell::Cell;
+use std::default::Default;
+use std::ops::Deref;
+use std::rc::Rc;
+use std::str::FromStr;
+use std::{fmt, mem};
+
+use cssparser::match_ignore_ascii_case;
+use devtools_traits::AttrInfo;
+use dom_struct::dom_struct;
+use euclid::default::{Rect, Size2D};
+use html5ever::serialize::TraversalScope::{ChildrenOnly, IncludeNode};
+use html5ever::serialize::{SerializeOpts, TraversalScope};
+use html5ever::{
+    local_name, namespace_prefix, namespace_url, ns, serialize, LocalName, Namespace, Prefix,
+    QualName,
+};
+use js::jsapi::Heap;
+use js::jsval::JSVal;
+use js::rust::HandleObject;
+use msg::constellation_msg::InputMethodType;
+use net_traits::request::CorsSettings;
+use net_traits::ReferrerPolicy;
+use script_layout_interface::message::ReflowGoal;
+use selectors::attr::{AttrSelectorOperation, CaseSensitivity, NamespaceConstraint};
+use selectors::matching::{ElementSelectorFlags, MatchingContext};
+use selectors::sink::Push;
+use selectors::Element as SelectorsElement;
+use servo_arc::Arc;
+use servo_atoms::Atom;
+use style::applicable_declarations::ApplicableDeclarationBlock;
+use style::attr::{AttrValue, LengthOrPercentageOrAuto};
+use style::context::QuirksMode;
+use style::invalidation::element::restyle_hints::RestyleHint;
+use style::properties::longhands::{
+    self, background_image, border_spacing, font_family, font_size,
+};
+use style::properties::{
+    parse_style_attribute, ComputedValues, Importance, PropertyDeclaration,
+    PropertyDeclarationBlock,
+};
+use style::rule_tree::CascadeLevel;
+use style::selector_parser::{
+    extended_filtering, NonTSPseudoClass, PseudoElement, RestyleDamage, SelectorImpl,
+    SelectorParser,
+};
+use style::shared_lock::{Locked, SharedRwLock};
+use style::stylesheets::layer_rule::LayerOrder;
+use style::stylesheets::CssRuleType;
+use style::values::generics::NonNegative;
+use style::values::{computed, specified, AtomIdent, AtomString, CSSFloat};
+use style::{dom_apis, thread_state, CaseSensitivityExt};
+use style_traits::dom::ElementState;
+use xml5ever::serialize as xmlSerialize;
+use xml5ever::serialize::TraversalScope::{
+    ChildrenOnly as XmlChildrenOnly, IncludeNode as XmlIncludeNode,
+};
+use xml5ever::serialize::{SerializeOpts as XmlSerializeOpts, TraversalScope as XmlTraversalScope};
+
 use crate::dom::activation::Activatable;
 use crate::dom::attr::{Attr, AttrHelpersForLayout};
 use crate::dom::bindings::cell::{ref_filter_map, DomRefCell, Ref, RefMut};
@@ -13,9 +73,10 @@ use crate::dom::bindings::codegen::Bindings::ElementBinding::ElementMethods;
 use crate::dom::bindings::codegen::Bindings::FunctionBinding::Function;
 use crate::dom::bindings::codegen::Bindings::HTMLTemplateElementBinding::HTMLTemplateElementMethods;
 use crate::dom::bindings::codegen::Bindings::NodeBinding::NodeMethods;
-use crate::dom::bindings::codegen::Bindings::ShadowRootBinding::ShadowRootBinding::ShadowRootMethods;
-use crate::dom::bindings::codegen::Bindings::WindowBinding::WindowMethods;
-use crate::dom::bindings::codegen::Bindings::WindowBinding::{ScrollBehavior, ScrollToOptions};
+use crate::dom::bindings::codegen::Bindings::ShadowRootBinding::ShadowRoot_Binding::ShadowRootMethods;
+use crate::dom::bindings::codegen::Bindings::WindowBinding::{
+    ScrollBehavior, ScrollToOptions, WindowMethods,
+};
 use crate::dom::bindings::codegen::UnionTypes::NodeOrString;
 use crate::dom::bindings::conversions::DerivedFrom;
 use crate::dom::bindings::error::{Error, ErrorResult, Fallible};
@@ -69,9 +130,10 @@ use crate::dom::htmltemplateelement::HTMLTemplateElement;
 use crate::dom::htmltextareaelement::{HTMLTextAreaElement, LayoutHTMLTextAreaElementHelpers};
 use crate::dom::mutationobserver::{Mutation, MutationObserver};
 use crate::dom::namednodemap::NamedNodeMap;
-use crate::dom::node::{document_from_node, window_from_node};
-use crate::dom::node::{BindContext, NodeDamage, NodeFlags, UnbindContext};
-use crate::dom::node::{ChildrenMutation, LayoutNodeHelpers, Node, ShadowIncluding};
+use crate::dom::node::{
+    document_from_node, window_from_node, BindContext, ChildrenMutation, LayoutNodeHelpers, Node,
+    NodeDamage, NodeFlags, ShadowIncluding, UnbindContext,
+};
 use crate::dom::nodelist::NodeList;
 use crate::dom::promise::Promise;
 use crate::dom::raredata::ElementRareData;
@@ -84,61 +146,6 @@ use crate::dom::window::ReflowReason;
 use crate::script_thread::ScriptThread;
 use crate::stylesheet_loader::StylesheetOwner;
 use crate::task::TaskOnce;
-use devtools_traits::AttrInfo;
-use dom_struct::dom_struct;
-use euclid::default::Rect;
-use html5ever::serialize;
-use html5ever::serialize::SerializeOpts;
-use html5ever::serialize::TraversalScope;
-use html5ever::serialize::TraversalScope::{ChildrenOnly, IncludeNode};
-use html5ever::{LocalName, Namespace, Prefix, QualName};
-use js::jsapi::Heap;
-use js::jsval::JSVal;
-use msg::constellation_msg::InputMethodType;
-use net_traits::request::CorsSettings;
-use net_traits::ReferrerPolicy;
-use script_layout_interface::message::ReflowGoal;
-use selectors::attr::{AttrSelectorOperation, CaseSensitivity, NamespaceConstraint};
-use selectors::matching::{ElementSelectorFlags, MatchingContext};
-use selectors::sink::Push;
-use selectors::Element as SelectorsElement;
-use servo_arc::Arc;
-use servo_atoms::Atom;
-use std::borrow::Cow;
-use std::cell::Cell;
-use std::default::Default;
-use std::fmt;
-use std::mem;
-use std::rc::Rc;
-use std::str::FromStr;
-use style::applicable_declarations::ApplicableDeclarationBlock;
-use style::attr::{AttrValue, LengthOrPercentageOrAuto};
-use style::context::QuirksMode;
-use style::dom_apis;
-use style::element_state::ElementState;
-use style::invalidation::element::restyle_hints::RestyleHint;
-use style::properties::longhands::{
-    self, background_image, border_spacing, font_family, font_size,
-};
-use style::properties::longhands::{overflow_x, overflow_y};
-use style::properties::{parse_style_attribute, PropertyDeclarationBlock};
-use style::properties::{ComputedValues, Importance, PropertyDeclaration};
-use style::rule_tree::CascadeLevel;
-use style::selector_parser::extended_filtering;
-use style::selector_parser::{
-    NonTSPseudoClass, PseudoElement, RestyleDamage, SelectorImpl, SelectorParser,
-};
-use style::shared_lock::{Locked, SharedRwLock};
-use style::stylesheets::CssRuleType;
-use style::thread_state;
-use style::values::generics::NonNegative;
-use style::values::{computed, specified, AtomIdent, AtomString, CSSFloat};
-use style::CaseSensitivityExt;
-use xml5ever::serialize as xmlSerialize;
-use xml5ever::serialize::SerializeOpts as XmlSerializeOpts;
-use xml5ever::serialize::TraversalScope as XmlTraversalScope;
-use xml5ever::serialize::TraversalScope::ChildrenOnly as XmlChildrenOnly;
-use xml5ever::serialize::TraversalScope::IncludeNode as XmlIncludeNode;
 
 // TODO: Update focus state when the top-level browsing context gains or loses system focus,
 // and when the element enters or leaves a browsing context container.
@@ -147,23 +154,31 @@ use xml5ever::serialize::TraversalScope::IncludeNode as XmlIncludeNode;
 #[dom_struct]
 pub struct Element {
     node: Node,
+    #[no_trace]
     local_name: LocalName,
     tag_name: TagName,
+    #[no_trace]
     namespace: Namespace,
+    #[no_trace]
     prefix: DomRefCell<Option<Prefix>>,
     attrs: DomRefCell<Vec<Dom<Attr>>>,
+    #[no_trace]
     id_attribute: DomRefCell<Option<Atom>>,
+    #[no_trace]
     is: DomRefCell<Option<LocalName>>,
     #[ignore_malloc_size_of = "Arc"]
+    #[no_trace]
     style_attribute: DomRefCell<Option<Arc<Locked<PropertyDeclarationBlock>>>>,
     attr_list: MutNullableDom<NamedNodeMap>,
     class_list: MutNullableDom<DOMTokenList>,
+    #[no_trace]
     state: Cell<ElementState>,
     /// These flags are set by the style system to indicate the that certain
     /// operations may require restyling this element or its descendants. The
     /// flags are not atomic, so the style system takes care of only set them
     /// when it has exclusive access to the element.
     #[ignore_malloc_size_of = "bitflags defined in rust-selectors"]
+    #[no_trace]
     selector_flags: Cell<ElementSelectorFlags>,
     rare_data: DomRefCell<Option<Box<ElementRareData>>>,
 }
@@ -241,8 +256,9 @@ impl Element {
         document: &Document,
         creator: ElementCreator,
         mode: CustomElementCreationMode,
+        proto: Option<HandleObject>,
     ) -> DomRoot<Element> {
-        create_element(name, is, document, creator, mode)
+        create_element(name, is, document, creator, mode, proto)
     }
 
     pub fn new_inherited(
@@ -290,12 +306,14 @@ impl Element {
         namespace: Namespace,
         prefix: Option<Prefix>,
         document: &Document,
+        proto: Option<HandleObject>,
     ) -> DomRoot<Element> {
-        Node::reflect_node(
+        Node::reflect_node_with_proto(
             Box::new(Element::new_inherited(
                 local_name, namespace, prefix, document,
             )),
             document,
+            proto,
         )
     }
 
@@ -333,7 +351,7 @@ impl Element {
             CustomElementState::Uncustomized | CustomElementState::Custom => true,
             _ => false,
         };
-        self.set_state(ElementState::IN_DEFINED_STATE, in_defined_state)
+        self.set_state(ElementState::DEFINED, in_defined_state)
     }
 
     pub fn get_custom_element_state(&self) -> CustomElementState {
@@ -408,44 +426,57 @@ impl Element {
     }
 
     // https://drafts.csswg.org/cssom-view/#potentially-scrollable
-    fn potentially_scrollable(&self) -> bool {
-        self.has_css_layout_box() && !self.has_any_visible_overflow()
+    fn is_potentially_scrollable_body(&self) -> bool {
+        let node = self.upcast::<Node>();
+        debug_assert!(
+            node.owner_doc().GetBody().as_deref() == self.downcast::<HTMLElement>(),
+            "Called is_potentially_scrollable_body on element that is not the <body>"
+        );
+
+        // "An element body (which will be the body element) is potentially
+        // scrollable if all of the following conditions are true:
+        //  - body has an associated box."
+        if !self.has_css_layout_box() {
+            return false;
+        }
+
+        // " - body’s parent element’s computed value of the overflow-x or
+        //     overflow-y properties is neither visible nor clip."
+        if let Some(parent) = node.GetParentElement() {
+            if let Some(style) = parent.style() {
+                if !style.get_box().clone_overflow_x().is_scrollable() &&
+                    !style.get_box().clone_overflow_y().is_scrollable()
+                {
+                    return false;
+                }
+            };
+        }
+
+        // " - body’s computed value of the overflow-x or overflow-y properties
+        //     is neither visible nor clip."
+        if let Some(style) = self.style() {
+            if !style.get_box().clone_overflow_x().is_scrollable() &&
+                !style.get_box().clone_overflow_y().is_scrollable()
+            {
+                return false;
+            }
+        };
+
+        true
     }
 
     // https://drafts.csswg.org/cssom-view/#scrolling-box
     fn has_scrolling_box(&self) -> bool {
         // TODO: scrolling mechanism, such as scrollbar (We don't have scrollbar yet)
         //       self.has_scrolling_mechanism()
-        self.has_any_hidden_overflow()
+        self.style().map_or(false, |style| {
+            style.get_box().clone_overflow_x().is_scrollable() ||
+                style.get_box().clone_overflow_y().is_scrollable()
+        })
     }
 
     fn has_overflow(&self) -> bool {
         self.ScrollHeight() > self.ClientHeight() || self.ScrollWidth() > self.ClientWidth()
-    }
-
-    // TODO: Once #19183 is closed (overflow-x/y types moved out of mako), then we could implement
-    //       a more generic `fn has_some_overflow(&self, overflow: Overflow)` rather than have
-    //       these two `has_any_{visible,hidden}_overflow` methods which are very structurally
-    //       similar.
-
-    /// Computed value of overflow-x or overflow-y is "visible"
-    fn has_any_visible_overflow(&self) -> bool {
-        self.style().map_or(false, |s| {
-            let box_ = s.get_box();
-
-            box_.clone_overflow_x() == overflow_x::computed_value::T::Visible ||
-                box_.clone_overflow_y() == overflow_y::computed_value::T::Visible
-        })
-    }
-
-    /// Computed value of overflow-x or overflow-y is "hidden"
-    fn has_any_hidden_overflow(&self) -> bool {
-        self.style().map_or(false, |s| {
-            let box_ = s.get_box();
-
-            box_.clone_overflow_x() == overflow_x::computed_value::T::Hidden ||
-                box_.clone_overflow_y() == overflow_y::computed_value::T::Hidden
-        })
     }
 
     fn shadow_root(&self) -> Option<DomRoot<ShadowRoot>> {
@@ -527,10 +558,9 @@ impl Element {
 
     // https://html.spec.whatwg.org/multipage/#translation-mode
     pub fn is_translate_enabled(&self) -> bool {
-        // TODO change this to local_name! when html5ever updates
-        let name = &LocalName::from("translate");
+        let name = &html5ever::local_name!("translate");
         if self.has_attribute(name) {
-            match &*self.get_string_attribute(name) {
+            match_ignore_ascii_case! { &*self.get_string_attribute(name),
                 "yes" | "" => return true,
                 "no" => return false,
                 _ => {},
@@ -541,7 +571,7 @@ impl Element {
                 return elem.is_translate_enabled();
             }
         }
-        true // whatwg/html#5239
+        true
     }
 
     // https://html.spec.whatwg.org/multipage/#the-directionality
@@ -552,6 +582,13 @@ impl Element {
                 let node = self.upcast::<Node>();
                 node.parent_directionality()
             })
+    }
+
+    pub(crate) fn is_root(&self) -> bool {
+        match self.node.GetParentNode() {
+            None => false,
+            Some(node) => node.is::<Document>(),
+        }
     }
 }
 
@@ -600,12 +637,7 @@ pub trait LayoutElementHelpers<'dom> {
 impl<'dom> LayoutDom<'dom, Element> {
     #[allow(unsafe_code)]
     pub(super) fn focus_state(self) -> bool {
-        unsafe {
-            self.unsafe_get()
-                .state
-                .get()
-                .contains(ElementState::IN_FOCUS_STATE)
-        }
+        unsafe { self.unsafe_get().state.get().contains(ElementState::FOCUS) }
     }
 }
 
@@ -648,6 +680,7 @@ impl<'dom> LayoutElementHelpers<'dom> for LayoutDom<'dom, Element> {
                     Importance::Normal,
                 ))),
                 CascadeLevel::PresHints,
+                LayerOrder::root(),
             )
         }
 
@@ -669,9 +702,13 @@ impl<'dom> LayoutElementHelpers<'dom> for LayoutDom<'dom, Element> {
         };
 
         if let Some(color) = bgcolor {
+            use cssparser::FromParsedColor;
             hints.push(from_declaration(
                 shared_lock,
-                PropertyDeclaration::BackgroundColor(color.into()),
+                PropertyDeclaration::BackgroundColor(
+                    specified::Color::from_rgba(color.red, color.green, color.blue, color.alpha)
+                        .into(),
+                ),
             ));
         }
 
@@ -703,9 +740,13 @@ impl<'dom> LayoutElementHelpers<'dom> for LayoutDom<'dom, Element> {
         };
 
         if let Some(color) = color {
+            use cssparser::FromParsedColor;
             hints.push(from_declaration(
                 shared_lock,
-                PropertyDeclaration::Color(longhands::color::SpecifiedValue(color.into())),
+                PropertyDeclaration::Color(longhands::color::SpecifiedValue(
+                    specified::Color::from_rgba(color.red, color.green, color.blue, color.alpha)
+                        .into(),
+                )),
             ));
         }
 
@@ -720,9 +761,9 @@ impl<'dom> LayoutElementHelpers<'dom> for LayoutDom<'dom, Element> {
             hints.push(from_declaration(
                 shared_lock,
                 PropertyDeclaration::FontFamily(font_family::SpecifiedValue::Values(
-                    computed::font::FontFamilyList::new(Box::new([
-                        computed::font::SingleFontFamily::from_atom(font_family),
-                    ])),
+                    computed::font::FontFamilyList {
+                        list: Box::new([computed::font::SingleFontFamily::from_atom(font_family)]),
+                    },
                 )),
             ));
         }
@@ -930,9 +971,7 @@ impl<'dom> LayoutElementHelpers<'dom> for LayoutDom<'dom, Element> {
         };
 
         if let Some(border) = border {
-            let width_value = specified::BorderSideWidth::Length(NonNegative(
-                specified::Length::from_px(border as f32),
-            ));
+            let width_value = specified::BorderSideWidth::from_px(border as f32);
             hints.push(from_declaration(
                 shared_lock,
                 PropertyDeclaration::BorderTopWidth(width_value.clone()),
@@ -1765,7 +1804,7 @@ impl Element {
         // Step 9
         if doc.GetBody().as_deref() == self.downcast::<HTMLElement>() &&
             doc.quirks_mode() == QuirksMode::Quirks &&
-            !self.potentially_scrollable()
+            !self.is_potentially_scrollable_body()
         {
             win.scroll(x, y, behavior);
             return;
@@ -1804,7 +1843,12 @@ impl Element {
             {
                 DomRoot::from_ref(elem)
             },
-            _ => DomRoot::upcast(HTMLBodyElement::new(local_name!("body"), None, owner_doc)),
+            _ => DomRoot::upcast(HTMLBodyElement::new(
+                local_name!("body"),
+                None,
+                owner_doc,
+                None,
+            )),
         }
     }
 
@@ -2305,7 +2349,7 @@ impl ElementMethods for Element {
         // Step 7
         if doc.GetBody().as_deref() == self.downcast::<HTMLElement>() &&
             doc.quirks_mode() == QuirksMode::Quirks &&
-            !self.potentially_scrollable()
+            !self.is_potentially_scrollable_body()
         {
             return win.ScrollY() as f64;
         }
@@ -2355,7 +2399,7 @@ impl ElementMethods for Element {
         // Step 9
         if doc.GetBody().as_deref() == self.downcast::<HTMLElement>() &&
             doc.quirks_mode() == QuirksMode::Quirks &&
-            !self.potentially_scrollable()
+            !self.is_potentially_scrollable_body()
         {
             win.scroll(win.ScrollX() as f64, y, behavior);
             return;
@@ -2401,7 +2445,7 @@ impl ElementMethods for Element {
         // Step 7
         if doc.GetBody().as_deref() == self.downcast::<HTMLElement>() &&
             doc.quirks_mode() == QuirksMode::Quirks &&
-            !self.potentially_scrollable()
+            !self.is_potentially_scrollable_body()
         {
             return win.ScrollX() as f64;
         }
@@ -2452,7 +2496,7 @@ impl ElementMethods for Element {
         // Step 9
         if doc.GetBody().as_deref() == self.downcast::<HTMLElement>() &&
             doc.quirks_mode() == QuirksMode::Quirks &&
-            !self.potentially_scrollable()
+            !self.is_potentially_scrollable_body()
         {
             win.scroll(x, win.ScrollY() as f64, behavior);
             return;
@@ -2575,6 +2619,7 @@ impl ElementMethods for Element {
                     &context_document,
                     ElementCreator::ScriptCreated,
                     CustomElementCreationMode::Synchronous,
+                    None,
                 );
                 DomRoot::upcast(body_elem)
             },
@@ -2677,12 +2722,14 @@ impl ElementMethods for Element {
 
     // https://dom.spec.whatwg.org/#dom-element-matches
     fn Matches(&self, selectors: DOMString) -> Fallible<bool> {
-        let selectors = match SelectorParser::parse_author_origin_no_namespace(&selectors) {
+        let doc = document_from_node(self);
+        let url = doc.url();
+        let selectors = match SelectorParser::parse_author_origin_no_namespace(&selectors, &url) {
             Err(_) => return Err(Error::Syntax),
             Ok(selectors) => selectors,
         };
 
-        let quirks_mode = document_from_node(self).quirks_mode();
+        let quirks_mode = doc.quirks_mode();
         let element = DomRoot::from_ref(self);
 
         Ok(dom_apis::element_matches(&element, &selectors, quirks_mode))
@@ -2695,12 +2742,14 @@ impl ElementMethods for Element {
 
     // https://dom.spec.whatwg.org/#dom-element-closest
     fn Closest(&self, selectors: DOMString) -> Fallible<Option<DomRoot<Element>>> {
-        let selectors = match SelectorParser::parse_author_origin_no_namespace(&selectors) {
+        let doc = document_from_node(self);
+        let url = doc.url();
+        let selectors = match SelectorParser::parse_author_origin_no_namespace(&selectors, &url) {
             Err(_) => return Err(Error::Syntax),
             Ok(selectors) => selectors,
         };
 
-        let quirks_mode = document_from_node(self).quirks_mode();
+        let quirks_mode = doc.quirks_mode();
         Ok(dom_apis::element_closest(
             DomRoot::from_ref(self),
             &selectors,
@@ -3135,6 +3184,10 @@ impl<'a> SelectorsElement for DomRoot<Element> {
             .next()
     }
 
+    fn first_element_child(&self) -> Option<DomRoot<Element>> {
+        self.GetFirstElementChild()
+    }
+
     fn attr_matches(
         &self,
         ns: &NamespaceConstraint<&style::Namespace>,
@@ -3152,10 +3205,7 @@ impl<'a> SelectorsElement for DomRoot<Element> {
     }
 
     fn is_root(&self) -> bool {
-        match self.node.GetParentNode() {
-            None => false,
-            Some(node) => node.is::<Document>(),
-        }
+        Element::is_root(self)
     }
 
     fn is_empty(&self) -> bool {
@@ -3181,15 +3231,11 @@ impl<'a> SelectorsElement for DomRoot<Element> {
             Element::namespace(self) == Element::namespace(other)
     }
 
-    fn match_non_ts_pseudo_class<F>(
+    fn match_non_ts_pseudo_class(
         &self,
         pseudo_class: &NonTSPseudoClass,
         _: &mut MatchingContext<Self::Impl>,
-        _: &mut F,
-    ) -> bool
-    where
-        F: FnMut(&Self, ElementSelectorFlags),
-    {
+    ) -> bool {
         match *pseudo_class {
             // https://github.com/servo/servo/issues/8718
             NonTSPseudoClass::Link | NonTSPseudoClass::AnyLink => self.is_link(),
@@ -3219,6 +3265,8 @@ impl<'a> SelectorsElement for DomRoot<Element> {
             NonTSPseudoClass::Enabled |
             NonTSPseudoClass::Disabled |
             NonTSPseudoClass::Checked |
+            NonTSPseudoClass::Valid |
+            NonTSPseudoClass::Invalid |
             NonTSPseudoClass::Indeterminate |
             NonTSPseudoClass::ReadWrite |
             NonTSPseudoClass::PlaceholderShown |
@@ -3268,6 +3316,32 @@ impl<'a> SelectorsElement for DomRoot<Element> {
     fn is_html_slot_element(&self) -> bool {
         self.is_html_element() && self.local_name() == &local_name!("slot")
     }
+
+    fn apply_selector_flags(&self, flags: ElementSelectorFlags) {
+        // Handle flags that apply to the element.
+        let self_flags = flags.for_self();
+        if !self_flags.is_empty() {
+            #[allow(unsafe_code)]
+            unsafe {
+                Dom::from_ref(self.deref())
+                    .to_layout()
+                    .insert_selector_flags(self_flags);
+            }
+        }
+
+        // Handle flags that apply to the parent.
+        let parent_flags = flags.for_parent();
+        if !parent_flags.is_empty() {
+            if let Some(p) = self.parent_element() {
+                #[allow(unsafe_code)]
+                unsafe {
+                    Dom::from_ref(p.deref())
+                        .to_layout()
+                        .insert_selector_flags(parent_flags);
+                }
+            }
+        }
+    }
 }
 
 impl Element {
@@ -3280,7 +3354,25 @@ impl Element {
         {
             return rect;
         }
-        let rect = self.upcast::<Node>().client_rect();
+
+        let mut rect = self.upcast::<Node>().client_rect();
+        let in_quirks_mode = self.node.owner_doc().quirks_mode() == QuirksMode::Quirks;
+
+        if (in_quirks_mode &&
+            self.node.owner_doc().GetBody().as_deref() == self.downcast::<HTMLElement>()) ||
+            (!in_quirks_mode && *self.root_element() == *self)
+        {
+            let viewport_dimensions = self
+                .node
+                .owner_doc()
+                .window()
+                .window_size()
+                .initial_viewport
+                .round()
+                .to_i32();
+            rect.size = Size2D::<i32>::new(viewport_dimensions.width, viewport_dimensions.height);
+        }
+
         self.ensure_rare_data().client_rect = Some(window_from_node(self).cache_layout_value(rect));
         rect
     }
@@ -3453,7 +3545,7 @@ impl Element {
 
     /// <https://html.spec.whatwg.org/multipage/#concept-selector-active>
     pub fn set_active_state(&self, value: bool) {
-        self.set_state(ElementState::IN_ACTIVE_STATE, value);
+        self.set_state(ElementState::ACTIVE, value);
 
         if let Some(parent) = self.upcast::<Node>().GetParentElement() {
             parent.set_active_state(value);
@@ -3461,65 +3553,63 @@ impl Element {
     }
 
     pub fn focus_state(&self) -> bool {
-        self.state.get().contains(ElementState::IN_FOCUS_STATE)
+        self.state.get().contains(ElementState::FOCUS)
     }
 
     pub fn set_focus_state(&self, value: bool) {
-        self.set_state(ElementState::IN_FOCUS_STATE, value);
+        self.set_state(ElementState::FOCUS, value);
         self.upcast::<Node>().dirty(NodeDamage::OtherNodeDamage);
     }
 
     pub fn hover_state(&self) -> bool {
-        self.state.get().contains(ElementState::IN_HOVER_STATE)
+        self.state.get().contains(ElementState::HOVER)
     }
 
     pub fn set_hover_state(&self, value: bool) {
-        self.set_state(ElementState::IN_HOVER_STATE, value)
+        self.set_state(ElementState::HOVER, value)
     }
 
     pub fn enabled_state(&self) -> bool {
-        self.state.get().contains(ElementState::IN_ENABLED_STATE)
+        self.state.get().contains(ElementState::ENABLED)
     }
 
     pub fn set_enabled_state(&self, value: bool) {
-        self.set_state(ElementState::IN_ENABLED_STATE, value)
+        self.set_state(ElementState::ENABLED, value)
     }
 
     pub fn disabled_state(&self) -> bool {
-        self.state.get().contains(ElementState::IN_DISABLED_STATE)
+        self.state.get().contains(ElementState::DISABLED)
     }
 
     pub fn set_disabled_state(&self, value: bool) {
-        self.set_state(ElementState::IN_DISABLED_STATE, value)
+        self.set_state(ElementState::DISABLED, value)
     }
 
     pub fn read_write_state(&self) -> bool {
-        self.state.get().contains(ElementState::IN_READ_WRITE_STATE)
+        self.state.get().contains(ElementState::READWRITE)
     }
 
     pub fn set_read_write_state(&self, value: bool) {
-        self.set_state(ElementState::IN_READ_WRITE_STATE, value)
+        self.set_state(ElementState::READWRITE, value)
     }
 
     pub fn placeholder_shown_state(&self) -> bool {
-        self.state
-            .get()
-            .contains(ElementState::IN_PLACEHOLDER_SHOWN_STATE)
+        self.state.get().contains(ElementState::PLACEHOLDER_SHOWN)
     }
 
     pub fn set_placeholder_shown_state(&self, value: bool) {
         if self.placeholder_shown_state() != value {
-            self.set_state(ElementState::IN_PLACEHOLDER_SHOWN_STATE, value);
+            self.set_state(ElementState::PLACEHOLDER_SHOWN, value);
             self.upcast::<Node>().dirty(NodeDamage::OtherNodeDamage);
         }
     }
 
     pub fn set_target_state(&self, value: bool) {
-        self.set_state(ElementState::IN_TARGET_STATE, value)
+        self.set_state(ElementState::URLTARGET, value)
     }
 
     pub fn set_fullscreen_state(&self, value: bool) {
-        self.set_state(ElementState::IN_FULLSCREEN_STATE, value)
+        self.set_state(ElementState::FULLSCREEN, value)
     }
 
     /// <https://dom.spec.whatwg.org/#connected>
@@ -3624,6 +3714,7 @@ impl<'a> AttributeMutation<'a> {
 /// owner changes.
 #[derive(JSTraceable, MallocSizeOf)]
 struct TagName {
+    #[no_trace]
     ptr: DomRefCell<Option<LocalName>>,
 }
 
@@ -3678,7 +3769,7 @@ impl ElementPerformFullscreenEnter {
 }
 
 impl TaskOnce for ElementPerformFullscreenEnter {
-    #[allow(unrooted_must_root)]
+    #[allow(crown::unrooted_must_root)]
     fn run_once(self) {
         let element = self.element.root();
         let promise = self.promise.root();
@@ -3729,7 +3820,7 @@ impl ElementPerformFullscreenExit {
 }
 
 impl TaskOnce for ElementPerformFullscreenExit {
-    #[allow(unrooted_must_root)]
+    #[allow(crown::unrooted_must_root)]
     fn run_once(self) {
         let element = self.element.root();
         let document = document_from_node(&*element);

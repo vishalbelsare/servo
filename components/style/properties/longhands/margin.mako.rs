@@ -16,7 +16,7 @@
         "margin-%s" % side[0],
         "LengthPercentageOrAuto",
         "computed::LengthPercentageOrAuto::zero()",
-        engines="gecko servo-2013 servo-2020",
+        engines="gecko servo",
         aliases=maybe_moz_logical_alias(engine, side, "-moz-margin-%s"),
         allow_quirks="No" if side[1] else "Yes",
         animation_value_type="ComputedValue",
@@ -27,6 +27,16 @@
         servo_restyle_damage="reflow"
     )}
 % endfor
+
+${helpers.predefined_type(
+    "overflow-clip-margin",
+    "Length",
+    "computed::Length::zero()",
+    parse_method="parse_non_negative",
+    engines="gecko",
+    spec="https://drafts.csswg.org/css-overflow/#propdef-overflow-clip-margin",
+    animation_value_type="ComputedValue",
+)}
 
 % for side in ALL_SIDES:
     ${helpers.predefined_type(

@@ -2,6 +2,25 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+use std::borrow::ToOwned;
+use std::cell::Cell;
+use std::ptr;
+
+use dom_struct::dom_struct;
+use ipc_channel::ipc::{self, IpcReceiver, IpcSender};
+use ipc_channel::router::ROUTER;
+use js::jsapi::{JSAutoRealm, JSObject};
+use js::jsval::UndefinedValue;
+use js::rust::{CustomAutoRooterGuard, HandleObject};
+use js::typedarray::{ArrayBuffer, ArrayBufferView, CreateWith};
+use net_traits::request::{Referrer, RequestBuilder, RequestMode};
+use net_traits::{
+    CoreResourceMsg, FetchChannels, MessageData, WebSocketDomAction, WebSocketNetworkEvent,
+};
+use profile_traits::ipc as ProfiledIpc;
+use script_traits::serializable::BlobImpl;
+use servo_url::{ImmutableOrigin, ServoUrl};
+
 use crate::dom::bindings::cell::DomRefCell;
 use crate::dom::bindings::codegen::Bindings::BlobBinding::BlobMethods;
 use crate::dom::bindings::codegen::Bindings::WebSocketBinding::{BinaryType, WebSocketMethods};
@@ -10,7 +29,7 @@ use crate::dom::bindings::conversions::ToJSValConvertible;
 use crate::dom::bindings::error::{Error, ErrorResult, Fallible};
 use crate::dom::bindings::inheritance::Castable;
 use crate::dom::bindings::refcounted::Trusted;
-use crate::dom::bindings::reflector::{reflect_dom_object, DomObject};
+use crate::dom::bindings::reflector::{reflect_dom_object_with_proto, DomObject};
 use crate::dom::bindings::root::DomRoot;
 use crate::dom::bindings::str::{is_token, DOMString, USVString};
 use crate::dom::blob::Blob;
@@ -24,23 +43,6 @@ use crate::script_runtime::ScriptThreadEventCategory::WebSocketEvent;
 use crate::task::{TaskCanceller, TaskOnce};
 use crate::task_source::websocket::WebsocketTaskSource;
 use crate::task_source::TaskSource;
-use dom_struct::dom_struct;
-use ipc_channel::ipc::{self, IpcReceiver, IpcSender};
-use ipc_channel::router::ROUTER;
-use js::jsapi::{JSAutoRealm, JSObject};
-use js::jsval::UndefinedValue;
-use js::rust::CustomAutoRooterGuard;
-use js::typedarray::{ArrayBuffer, ArrayBufferView, CreateWith};
-use net_traits::request::{Referrer, RequestBuilder, RequestMode};
-use net_traits::MessageData;
-use net_traits::{CoreResourceMsg, FetchChannels};
-use net_traits::{WebSocketDomAction, WebSocketNetworkEvent};
-use profile_traits::ipc as ProfiledIpc;
-use script_traits::serializable::BlobImpl;
-use servo_url::{ImmutableOrigin, ServoUrl};
-use std::borrow::ToOwned;
-use std::cell::Cell;
-use std::ptr;
 
 #[derive(Clone, Copy, Debug, JSTraceable, MallocSizeOf, PartialEq)]
 enum WebSocketRequestState {
@@ -101,11 +103,13 @@ fn fail_the_websocket_connection(
 #[dom_struct]
 pub struct WebSocket {
     eventtarget: EventTarget,
+    #[no_trace]
     url: ServoUrl,
     ready_state: Cell<WebSocketRequestState>,
     buffered_amount: Cell<u64>,
     clearing_buffer: Cell<bool>, //Flag to tell if there is a running thread to clear buffered_amount
     #[ignore_malloc_size_of = "Defined in std"]
+    #[no_trace]
     sender: IpcSender<WebSocketDomAction>,
     binary_type: Cell<BinaryType>,
     protocol: DomRefCell<String>, //Subprotocol selected by server
@@ -127,16 +131,22 @@ impl WebSocket {
 
     fn new(
         global: &GlobalScope,
+        proto: Option<HandleObject>,
         url: ServoUrl,
         sender: IpcSender<WebSocketDomAction>,
     ) -> DomRoot<WebSocket> {
-        reflect_dom_object(Box::new(WebSocket::new_inherited(url, sender)), global)
+        reflect_dom_object_with_proto(
+            Box::new(WebSocket::new_inherited(url, sender)),
+            global,
+            proto,
+        )
     }
 
     /// <https://html.spec.whatwg.org/multipage/#dom-websocket>
     #[allow(non_snake_case)]
     pub fn Constructor(
         global: &GlobalScope,
+        proto: Option<HandleObject>,
         url: DOMString,
         protocols: Option<StringOrStringSequence>,
     ) -> Fallible<DomRoot<WebSocket>> {
@@ -190,7 +200,7 @@ impl WebSocket {
             ProfiledIpc::IpcReceiver<WebSocketNetworkEvent>,
         ) = ProfiledIpc::channel(global.time_profiler_chan().clone()).unwrap();
 
-        let ws = WebSocket::new(global, url_record.clone(), dom_action_sender);
+        let ws = WebSocket::new(global, proto, url_record.clone(), dom_action_sender);
         let address = Trusted::new(&*ws);
 
         // Step 8.
@@ -554,9 +564,9 @@ impl TaskOnce for MessageReceivedTask {
 
         // Step 2-5.
         let global = ws.global();
-        // global.get_cx() returns a valid `JSContext` pointer, so this is safe.
+        // GlobalScope::get_cx() returns a valid `JSContext` pointer, so this is safe.
         unsafe {
-            let cx = global.get_cx();
+            let cx = GlobalScope::get_cx();
             let _ac = JSAutoRealm::new(*cx, ws.reflector().get_jsobject().get());
             rooted!(in(*cx) let mut message = UndefinedValue());
             match self.message {

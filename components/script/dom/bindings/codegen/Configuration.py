@@ -167,11 +167,11 @@ class DescriptorProvider:
         return self.config.getDescriptor(interfaceName)
 
 
-def MemberIsUnforgeable(member, descriptor):
+def MemberIsLegacyUnforgeable(member, descriptor):
     return ((member.isAttr() or member.isMethod())
             and not member.isStatic()
-            and (member.isUnforgeable()
-                 or bool(descriptor.interface.getExtendedAttribute("Unforgeable"))))
+            and (member.isLegacyUnforgeable()
+                 or bool(descriptor.interface.getExtendedAttribute("LegacyUnforgeable"))))
 
 
 class Descriptor(DescriptorProvider):
@@ -232,7 +232,7 @@ class Descriptor(DescriptorProvider):
         self.register = desc.get('register', True)
         self.path = desc.get('path', pathDefault)
         self.inRealmMethods = [name for name in desc.get('inRealms', [])]
-        self.bindingPath = 'crate::dom::bindings::codegen::Bindings::%s' % ('::'.join([ifaceName + 'Binding'] * 2))
+        self.bindingPath = f"crate::dom::bindings::codegen::Bindings::{ifaceName}Binding::{ifaceName}_Binding"
         self.outerObjectHook = desc.get('outerObjectHook', 'None')
         self.proxy = False
         self.weakReferenceable = desc.get('weakReferenceable', False)
@@ -244,9 +244,9 @@ class Descriptor(DescriptorProvider):
                          and not self.interface.getExtendedAttribute("Abstract")
                          and not self.interface.getExtendedAttribute("Inline")
                          and not spiderMonkeyInterface)
-        self.hasUnforgeableMembers = (self.concrete
-                                      and any(MemberIsUnforgeable(m, self) for m in
-                                              self.interface.members))
+        self.hasLegacyUnforgeableMembers = (self.concrete
+                                            and any(MemberIsLegacyUnforgeable(m, self) for m in
+                                                    self.interface.members))
 
         self.operations = {
             'IndexedGetter': None,
@@ -280,7 +280,8 @@ class Descriptor(DescriptorProvider):
                         continue
 
                     def addIndexedOrNamedOperation(operation, m):
-                        self.proxy = True
+                        if not self.isGlobal():
+                            self.proxy = True
                         if m.isIndexed():
                             operation = 'Indexed' + operation
                         else:
@@ -363,11 +364,31 @@ class Descriptor(DescriptorProvider):
         config.maxProtoChainLength = max(config.maxProtoChainLength,
                                          len(self.prototypeChain))
 
+    def maybeGetSuperModule(self):
+        """
+        Returns name of super module if self is part of it
+        """
+        filename = getIdlFileName(self.interface)
+        # if interface name is not same as webidl file
+        # webidl is super module for interface
+        if filename.lower() != self.interface.identifier.name.lower() and not self.interface.isIteratorInterface():
+            return filename
+        return None
+
     def binaryNameFor(self, name):
         return self._binaryNames.get(name, name)
 
     def internalNameFor(self, name):
         return self._internalNames.get(name, name)
+
+    def hasNamedPropertiesObject(self):
+        if self.interface.isExternal():
+            return False
+
+        return self.isGlobal() and self.supportsNamedProperties()
+
+    def supportsNamedProperties(self):
+        return self.operations['NamedGetter'] is not None
 
     def getExtendedAttributes(self, member, getter=False, setter=False):
         def maybeAppendInfallibleToAttrs(attrs, throws):
@@ -449,9 +470,12 @@ def MakeNativeName(name):
     return name[0].upper() + name[1:]
 
 
+def getIdlFileName(object):
+    return os.path.basename(object.location.filename()).split('.webidl')[0]
+
+
 def getModuleFromObject(object):
-    return ('crate::dom::bindings::codegen::Bindings::'
-            + os.path.basename(object.location.filename()).split('.webidl')[0] + 'Binding')
+    return ('crate::dom::bindings::codegen::Bindings::' + getIdlFileName(object) + 'Binding')
 
 
 def getTypesFromDescriptor(descriptor):
@@ -461,7 +485,7 @@ def getTypesFromDescriptor(descriptor):
     members = [m for m in descriptor.interface.members]
     if descriptor.interface.ctor():
         members.append(descriptor.interface.ctor())
-    members.extend(descriptor.interface.namedConstructors)
+    members.extend(descriptor.interface.legacyFactoryFunctions)
     signatures = [s for m in members if m.isMethod() for s in m.signatures()]
     types = []
     for s in signatures:
@@ -506,7 +530,11 @@ def getUnwrappedType(type):
 
 
 def iteratorNativeType(descriptor, infer=False):
-    assert descriptor.interface.isIterable()
     iterableDecl = descriptor.interface.maplikeOrSetlikeOrIterable
-    assert iterableDecl.isPairIterator()
-    return "IterableIterator%s" % ("" if infer else '<%s>' % descriptor.interface.identifier.name)
+    assert (iterableDecl.isIterable() and iterableDecl.isPairIterator()) \
+        or iterableDecl.isSetlike() or iterableDecl.isMaplike()
+    res = "IterableIterator%s" % ("" if infer else '<%s>' % descriptor.interface.identifier.name)
+    # todo: this hack is telling us that something is still wrong in codegen
+    if iterableDecl.isSetlike() or iterableDecl.isMaplike():
+        res = f"crate::dom::bindings::iterable::{res}"
+    return res

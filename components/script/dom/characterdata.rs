@@ -4,9 +4,11 @@
 
 //! DOM bindings for `CharacterData`.
 
+use dom_struct::dom_struct;
+
 use crate::dom::bindings::cell::{DomRefCell, Ref};
 use crate::dom::bindings::codegen::Bindings::CharacterDataBinding::CharacterDataMethods;
-use crate::dom::bindings::codegen::Bindings::NodeBinding::NodeBinding::NodeMethods;
+use crate::dom::bindings::codegen::Bindings::NodeBinding::Node_Binding::NodeMethods;
 use crate::dom::bindings::codegen::Bindings::ProcessingInstructionBinding::ProcessingInstructionMethods;
 use crate::dom::bindings::codegen::InheritTypes::{CharacterDataTypeId, NodeTypeId, TextTypeId};
 use crate::dom::bindings::codegen::UnionTypes::NodeOrString;
@@ -23,7 +25,6 @@ use crate::dom::node::{ChildrenMutation, Node, NodeDamage};
 use crate::dom::processinginstruction::ProcessingInstruction;
 use crate::dom::text::Text;
 use crate::dom::virtualmethods::vtable_for;
-use dom_struct::dom_struct;
 
 // https://dom.spec.whatwg.org/#characterdata
 #[dom_struct]
@@ -43,7 +44,7 @@ impl CharacterData {
     pub fn clone_with_data(&self, data: DOMString, document: &Document) -> DomRoot<Node> {
         match self.upcast::<Node>().type_id() {
             NodeTypeId::CharacterData(CharacterDataTypeId::Comment) => {
-                DomRoot::upcast(Comment::new(data, &document))
+                DomRoot::upcast(Comment::new(data, &document, None))
             },
             NodeTypeId::CharacterData(CharacterDataTypeId::ProcessingInstruction) => {
                 let pi = self.downcast::<ProcessingInstruction>().unwrap();

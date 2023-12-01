@@ -2,19 +2,21 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+use dom_struct::dom_struct;
+use js::rust::HandleObject;
+use url::form_urlencoded;
+
 use crate::dom::bindings::cell::DomRefCell;
 use crate::dom::bindings::codegen::Bindings::URLSearchParamsBinding::URLSearchParamsMethods;
 use crate::dom::bindings::codegen::UnionTypes::USVStringSequenceSequenceOrUSVStringUSVStringRecordOrUSVString;
 use crate::dom::bindings::error::{Error, Fallible};
 use crate::dom::bindings::iterable::Iterable;
-use crate::dom::bindings::reflector::{reflect_dom_object, Reflector};
+use crate::dom::bindings::reflector::{reflect_dom_object_with_proto, Reflector};
 use crate::dom::bindings::root::DomRoot;
 use crate::dom::bindings::str::{DOMString, USVString};
 use crate::dom::bindings::weakref::MutableWeakRef;
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::url::URL;
-use dom_struct::dom_struct;
-use url::form_urlencoded;
 
 // https://url.spec.whatwg.org/#interface-urlsearchparams
 #[dom_struct]
@@ -36,17 +38,26 @@ impl URLSearchParams {
     }
 
     pub fn new(global: &GlobalScope, url: Option<&URL>) -> DomRoot<URLSearchParams> {
-        reflect_dom_object(Box::new(URLSearchParams::new_inherited(url)), global)
+        Self::new_with_proto(global, None, url)
+    }
+
+    pub fn new_with_proto(
+        global: &GlobalScope,
+        proto: Option<HandleObject>,
+        url: Option<&URL>,
+    ) -> DomRoot<URLSearchParams> {
+        reflect_dom_object_with_proto(Box::new(URLSearchParams::new_inherited(url)), global, proto)
     }
 
     // https://url.spec.whatwg.org/#dom-urlsearchparams-urlsearchparams
     #[allow(non_snake_case)]
     pub fn Constructor(
         global: &GlobalScope,
+        proto: Option<HandleObject>,
         init: USVStringSequenceSequenceOrUSVStringUSVStringRecordOrUSVString,
     ) -> Fallible<DomRoot<URLSearchParams>> {
         // Step 1.
-        let query = URLSearchParams::new(global, None);
+        let query = URLSearchParams::new_with_proto(global, proto, None);
         match init {
             USVStringSequenceSequenceOrUSVStringUSVStringRecordOrUSVString::USVStringSequenceSequence(init) => {
                 // Step 2.
@@ -91,6 +102,11 @@ impl URLSearchParams {
 }
 
 impl URLSearchParamsMethods for URLSearchParams {
+    // https://url.spec.whatwg.org/#dom-urlsearchparams-size
+    fn Size(&self) -> u32 {
+        self.list.borrow().len() as u32
+    }
+
     // https://url.spec.whatwg.org/#dom-urlsearchparams-append
     fn Append(&self, name: USVString, value: USVString) {
         // Step 1.
@@ -100,9 +116,14 @@ impl URLSearchParamsMethods for URLSearchParams {
     }
 
     // https://url.spec.whatwg.org/#dom-urlsearchparams-delete
-    fn Delete(&self, name: USVString) {
+    fn Delete(&self, name: USVString, value: Option<USVString>) {
         // Step 1.
-        self.list.borrow_mut().retain(|&(ref k, _)| k != &name.0);
+        self.list
+            .borrow_mut()
+            .retain(|&(ref k, ref v)| match &value {
+                Some(value) => !(k == &name.0 && v == &value.0),
+                None => k != &name.0,
+            });
         // Step 2.
         self.update_steps();
     }
@@ -130,9 +151,12 @@ impl URLSearchParamsMethods for URLSearchParams {
     }
 
     // https://url.spec.whatwg.org/#dom-urlsearchparams-has
-    fn Has(&self, name: USVString) -> bool {
+    fn Has(&self, name: USVString, value: Option<USVString>) -> bool {
         let list = self.list.borrow();
-        list.iter().any(|&(ref k, _)| k == &name.0)
+        list.iter().any(|&(ref k, ref v)| match &value {
+            Some(value) => k == &name.0 && v == &value.0,
+            None => k == &name.0,
+        })
     }
 
     // https://url.spec.whatwg.org/#dom-urlsearchparams-set

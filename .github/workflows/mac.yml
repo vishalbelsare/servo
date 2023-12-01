@@ -1,0 +1,181 @@
+name: Mac
+
+on:
+  workflow_call:
+    inputs:
+      profile:
+        required: false
+        default: "release"
+        type: string
+      wpt-layout:
+        required: false
+        type: string
+      unit-tests:
+        required: false
+        default: false
+        type: boolean
+      upload:
+        required: false
+        default: false
+        type: boolean
+      github-release-id:
+        required: false
+        type: string
+  workflow_dispatch:
+    inputs:
+      profile:
+        required: false
+        default: "release"
+        type: choice
+        options: ["release", "debug", "production"]
+      wpt-layout:
+        required: false
+        type: choice
+        options: ["none", "2013", "2020", "all"]
+      unit-tests:
+        required: false
+        default: false
+        type: boolean
+      upload:
+        required: false
+        default: false
+        type: boolean
+  push:
+    branches: ["try-mac", "try-wpt-mac", "try-wpt-mac-2020"]
+
+env:
+  RUST_BACKTRACE: 1
+  SHELL: /bin/bash
+  SCCACHE_GHA_ENABLED: "true"
+  CCACHE: "sccache"
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  build:
+    name: Mac Build
+    runs-on: macos-13
+    steps:
+      # XProtect can cause random failures if it decides that the DMG we create
+      # during the packaging phase is malware.
+      # TODO(mrobinson): Is there a way we can do things in a less suspicious way so
+      # we don't have to kill this service?
+      - name: Kill XProtectBehaviorService
+        run: |
+          echo Killing XProtect.; sudo pkill -9 XProtect >/dev/null || true;
+      - uses: actions/checkout@v3
+        if: github.event_name != 'pull_request_target'
+        with:
+          fetch-depth: 2
+      # This is necessary to checkout the pull request if this run was triggered via a
+      # `pull_request_target` event.
+      - uses: actions/checkout@v3
+        if: github.event_name == 'pull_request_target'
+        with:
+          ref: refs/pull/${{ github.event.number }}/head
+          fetch-depth: 2
+      - name: Run sccache-cache
+        uses: mozilla-actions/sccache-action@v0.0.3
+      - name: Install taplo
+        uses: baptiste0928/cargo-install@v2
+        with:
+          crate: taplo-cli
+          locked: true
+      - name: Bootstrap
+        run: |
+          python3 -m pip install --upgrade pip virtualenv
+          python3 ./mach bootstrap
+          brew install gnu-tar
+      - name: Build (${{ inputs.profile }})
+        run: |
+          python3 ./mach build --${{ inputs.profile }}
+      - name: Smoketest
+        uses: nick-fields/retry@v2
+        with: # See https://github.com/servo/servo/issues/30757
+          timeout_minutes: 5
+          max_attempts: 2
+          command: python3 ./mach smoketest --${{ inputs.profile }}
+      - name: Script tests
+        run: ./mach test-scripts
+      - name: Unit tests
+        if: ${{ inputs.unit-tests || github.ref_name == 'try-mac' }}
+        uses: nick-fields/retry@v2
+        with:
+          timeout_minutes: 20 # https://github.com/servo/servo/issues/30275
+          max_attempts: 3 # https://github.com/servo/servo/issues/30683
+          command: python3 ./mach test-unit --${{ inputs.profile }}
+      - name: Build mach package
+        run: python3 ./mach package --${{ inputs.profile }}
+      - name: Run smoketest for mach package
+        uses: nick-fields/retry@v2
+        with: # See https://github.com/servo/servo/issues/30757
+          timeout_minutes: 5
+          max_attempts: 2
+          command: ./etc/ci/macos_package_smoketest.sh target/${{ inputs.profile }}/servo-tech-demo.dmg
+      - name: Rename build timing
+        run: cp -r target/cargo-timings target/cargo-timings-macos
+      - name: Archive build timing
+        uses: actions/upload-artifact@v3
+        with:
+          name: cargo-timings
+          # Using a wildcard here ensures that the archive includes the path.
+          path: target/cargo-timings-*
+      - name: Upload artifact for mach package
+        uses: actions/upload-artifact@v3
+        with:
+          name: mac
+          path: target/${{ inputs.profile }}/servo-tech-demo.dmg
+      - name: Upload nightly
+        if: ${{ inputs.upload }}
+        run: |
+          python3 ./mach upload-nightly mac --secret-from-environment \
+            --github-release-id ${{ inputs.github-release-id }}
+        env:
+          S3_UPLOAD_CREDENTIALS: ${{ secrets.S3_UPLOAD_CREDENTIALS }}
+          GITHUB_HOMEBREW_TOKEN: ${{ secrets.HOMEBREW_TOKEN }}
+          NIGHTLY_REPO_TOKEN: ${{ secrets.NIGHTLY_REPO_TOKEN }}
+          NIGHTLY_REPO: ${{ github.repository_owner }}/servo-nightly-builds
+      - name: Build package for target
+        run: gtar -czf target.tar.gz target/${{ inputs.profile }}/servo target/${{ inputs.profile }}/lib/*.dylib resources
+      - name: Upload package for target
+        uses: actions/upload-artifact@v3
+        with:
+          name: release-binary-macos
+          path: target.tar.gz
+
+  wpt-2020:
+    if: ${{ github.ref_name == 'try-wpt-mac-2020' || inputs.wpt-layout == '2020' || inputs.wpt-layout == 'all' }}
+    name: Mac WPT Tests 2020
+    needs: ["build"]
+    uses: ./.github/workflows/mac-wpt.yml
+    with:
+      profile: ${{ inputs.profile }}
+      layout: "layout-2020"
+    secrets: inherit
+
+  wpt-2013:
+    if: ${{ github.ref_name == 'try-wpt-mac' || inputs.wpt-layout == '2013' || inputs.wpt-layout == 'all' }}
+    name: Mac WPT Tests 2013
+    needs: ["build"]
+    uses: ./.github/workflows/mac-wpt.yml
+    with:
+      profile: ${{ inputs.profile }}
+      layout: "layout-2013"
+    secrets: inherit
+
+  result:
+    name: Result
+    runs-on: ubuntu-latest
+    if: always()
+    # needs all build to detect cancellation
+    needs:
+      - "build"
+      - "wpt-2020"
+      - "wpt-2013"
+
+    steps:
+      - name: Mark the job as successful
+        run: exit 0
+        if: ${{ !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled') }}
+      - name: Mark the job as unsuccessful
+        run: exit 1
+        if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')

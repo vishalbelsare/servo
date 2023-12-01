@@ -2,13 +2,15 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+use std::io;
+
+use devtools_traits::{ConsoleMessage, LogLevel, ScriptToDevtoolsControlMsg};
+use js::rust::describe_scripted_caller;
+
 use crate::dom::bindings::inheritance::Castable;
 use crate::dom::bindings::str::DOMString;
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::workerglobalscope::WorkerGlobalScope;
-use devtools_traits::{ConsoleMessage, LogLevel, ScriptToDevtoolsControlMsg};
-use js::rust::describe_scripted_caller;
-use std::io;
 
 // https://developer.mozilla.org/en-US/docs/Web/API/Console
 pub struct Console(());
@@ -17,7 +19,8 @@ impl Console {
     #[allow(unsafe_code)]
     fn send_to_devtools(global: &GlobalScope, level: LogLevel, message: DOMString) {
         if let Some(chan) = global.devtools_chan() {
-            let caller = unsafe { describe_scripted_caller(*global.get_cx()) }.unwrap_or_default();
+            let caller =
+                unsafe { describe_scripted_caller(*GlobalScope::get_cx()) }.unwrap_or_default();
             let console_message = ConsoleMessage {
                 message: String::from(message),
                 logLevel: level,

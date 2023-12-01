@@ -13,7 +13,9 @@ use crate::str::CssStringWriter;
 use crate::values::specified::Integer;
 use crate::values::CustomIdent;
 use crate::Atom;
-use cssparser::{AtRuleParser, DeclarationListParser, DeclarationParser};
+use cssparser::{
+    AtRuleParser, DeclarationParser, QualifiedRuleParser, RuleBodyItemParser, RuleBodyParser,
+};
 use cssparser::{CowRcStr, Parser, SourceLocation, Token};
 use selectors::parser::SelectorParseErrorKind;
 use std::fmt::{self, Write};
@@ -55,7 +57,12 @@ pub fn parse_counter_style_name<'i, 't>(
 }
 
 fn is_valid_name_definition(ident: &CustomIdent) -> bool {
-    ident.0 != atom!("decimal") && ident.0 != atom!("disc")
+    ident.0 != atom!("decimal") &&
+        ident.0 != atom!("disc") &&
+        ident.0 != atom!("circle") &&
+        ident.0 != atom!("square") &&
+        ident.0 != atom!("disclosure-closed") &&
+        ident.0 != atom!("disclosure-open")
 }
 
 /// Parse the prelude of an @counter-style rule
@@ -81,11 +88,11 @@ pub fn parse_counter_style_body<'i, 't>(
     let start = input.current_source_location();
     let mut rule = CounterStyleRuleData::empty(name, location);
     {
-        let parser = CounterStyleRuleParser {
-            context: context,
+        let mut parser = CounterStyleRuleParser {
+            context,
             rule: &mut rule,
         };
-        let mut iter = DeclarationListParser::new(input, parser);
+        let mut iter = RuleBodyParser::new(input, &mut parser);
         while let Some(declaration) = iter.next() {
             if let Err((error, slice)) = declaration {
                 let location = error.location;
@@ -148,6 +155,23 @@ impl<'a, 'b, 'i> AtRuleParser<'i> for CounterStyleRuleParser<'a, 'b> {
     type Error = StyleParseErrorKind<'i>;
 }
 
+impl<'a, 'b, 'i> QualifiedRuleParser<'i> for CounterStyleRuleParser<'a, 'b> {
+    type Prelude = ();
+    type QualifiedRule = ();
+    type Error = StyleParseErrorKind<'i>;
+}
+
+impl<'a, 'b, 'i> RuleBodyItemParser<'i, (), StyleParseErrorKind<'i>>
+    for CounterStyleRuleParser<'a, 'b>
+{
+    fn parse_qualified(&self) -> bool {
+        false
+    }
+    fn parse_declarations(&self) -> bool {
+        true
+    }
+}
+
 macro_rules! checker {
     ($self:ident._($value:ident)) => {};
     ($self:ident. $checker:ident($value:ident)) => {
@@ -208,15 +232,17 @@ macro_rules! counter_style_descriptors {
             type Declaration = ();
             type Error = StyleParseErrorKind<'i>;
 
-            fn parse_value<'t>(&mut self, name: CowRcStr<'i>, input: &mut Parser<'i, 't>)
-                               -> Result<(), ParseError<'i>> {
+            fn parse_value<'t>(
+                &mut self,
+                name: CowRcStr<'i>,
+                input: &mut Parser<'i, 't>,
+            ) -> Result<(), ParseError<'i>> {
                 match_ignore_ascii_case! { &*name,
                     $(
                         $name => {
-                            // DeclarationParser also calls parse_entirely
-                            // so we’d normally not need to,
-                            // but in this case we do because we set the value as a side effect
-                            // rather than returning it.
+                            // DeclarationParser also calls parse_entirely so we’d normally not
+                            // need to, but in this case we do because we set the value as a side
+                            // effect rather than returning it.
                             let value = input.parse_entirely(|i| Parse::parse(self.context, i))?;
                             self.rule.$ident = Some(value)
                         },
@@ -239,7 +265,7 @@ macro_rules! counter_style_descriptors {
                         dest.write_str("; ")?;
                     }
                 )+
-                dest.write_str("}")
+                dest.write_char('}')
             }
         }
     }
